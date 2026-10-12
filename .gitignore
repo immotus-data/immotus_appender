@@ -3,6 +3,7 @@
 *.bc
 *.dylib
 results/
+output_iso/
 .deps/
 tmp_check/
 regression.out

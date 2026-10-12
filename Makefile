@@ -19,6 +19,7 @@ EXTENSION = immotus_appender
 DATA = immotus_appender--0.1.sql
 
 REGRESS = appender
+ISOLATION = concurrency
 TAP_TESTS = 1
 
 # Standalone extension — use PGXS

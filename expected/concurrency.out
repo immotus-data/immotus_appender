@@ -1,0 +1,103 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s2_begin s1_insert s2_insert s1_count s2_count s3_count s1_commit s3_count s2_commit s3_count s3_segs
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_insert: INSERT INTO ct SELECT g, 's1' FROM generate_series(1, 100) g;
+step s2_insert: INSERT INTO ct SELECT g, 's2' FROM generate_series(1, 200) g;
+step s1_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who |count
+----+-----
+base|   10
+s1  |  100
+(2 rows)
+
+step s2_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who |count
+----+-----
+base|   10
+s2  |  200
+(2 rows)
+
+step s3_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who |count
+----+-----
+base|   10
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who |count
+----+-----
+base|   10
+s1  |  100
+(2 rows)
+
+step s2_commit: COMMIT;
+step s3_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who |count
+----+-----
+base|   10
+s1  |  100
+s2  |  200
+(3 rows)
+
+step s3_segs: SELECT count(*) AS segments FROM appender_meta m JOIN pg_class c ON c.relfilenode = m.relfilenode WHERE c.relname = 'ct';
+segments
+--------
+       2
+(1 row)
+
+
+starting permutation: s1_begin s2_begin s1_insert s2_insert s1_abort s2_commit s3_count
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_insert: INSERT INTO ct SELECT g, 's1' FROM generate_series(1, 100) g;
+step s2_insert: INSERT INTO ct SELECT g, 's2' FROM generate_series(1, 200) g;
+step s1_abort: ROLLBACK;
+step s2_commit: COMMIT;
+step s3_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who |count
+----+-----
+base|   10
+s2  |  200
+(2 rows)
+
+
+starting permutation: s1_rr s2_insert s1_insert s1_count s1_commit s3_count
+step s1_rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM ct;
+count
+-----
+   10
+(1 row)
+
+step s2_insert: INSERT INTO ct SELECT g, 's2' FROM generate_series(1, 200) g;
+step s1_insert: INSERT INTO ct SELECT g, 's1' FROM generate_series(1, 100) g;
+step s1_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who |count
+----+-----
+base|   10
+s1  |  100
+(2 rows)
+
+step s1_commit: COMMIT;
+step s3_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who |count
+----+-----
+base|   10
+s1  |  100
+s2  |  200
+(3 rows)
+
+
+starting permutation: s1_begin s1_insert s2_truncate s1_commit s3_count
+step s1_begin: BEGIN;
+step s1_insert: INSERT INTO ct SELECT g, 's1' FROM generate_series(1, 100) g;
+step s2_truncate: TRUNCATE ct; <waiting ...>
+step s1_commit: COMMIT;
+step s2_truncate: <... completed>
+step s3_count: SELECT who, count(*) FROM ct GROUP BY who ORDER BY who;
+who|count
+---+-----
+(0 rows)
+
