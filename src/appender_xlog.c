@@ -7,6 +7,7 @@
  */
 #include "postgres.h"
 
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "appender_xlog.h"
 
@@ -54,6 +55,10 @@ appender_xlog_sync(const RelFileLocator *rlocator, int segno)
 	XLogInsert(RM_APPENDER_ID, XLOG_APPENDER_SYNC);
 }
 
+/*
+ * Flushed at once: written after the commit record, so without the flush a
+ * crash could lose it and redo would recreate the files from earlier records.
+ */
 void
 appender_xlog_unlink(const RelFileLocator *rlocator, int segno)
 {
@@ -64,7 +69,7 @@ appender_xlog_unlink(const RelFileLocator *rlocator, int segno)
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
-	XLogInsert(RM_APPENDER_ID, XLOG_APPENDER_UNLINK);
+	XLogFlush(XLogInsert(RM_APPENDER_ID, XLOG_APPENDER_UNLINK));
 }
 
 void
