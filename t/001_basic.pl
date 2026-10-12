@@ -1,5 +1,3 @@
-# Copyright (c) 2026, Immotus Data Labs
-#
 # Basic tests for the appender table access method.
 
 use strict;
