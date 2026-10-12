@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    env:
+      PG_VERSION: REL_18_STABLE
+      PG_PREFIX: /home/runner/pgsql
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex libipc-run-perl \
+            libreadline-dev zlib1g-dev
+
+      - name: Cache PostgreSQL
+        id: cache-pg
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PG_PREFIX }}
+          key: pg-${{ env.PG_VERSION }}-tap-v1
+
+      - name: Build PostgreSQL
+        if: steps.cache-pg.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$PG_VERSION" \
+            https://github.com/postgres/postgres.git /tmp/postgres
+          cd /tmp/postgres
+          ./configure --prefix="$PG_PREFIX" --enable-tap-tests \
+            --enable-cassert --enable-debug
+          make -j"$(nproc)" install
+          make -C src/test/isolation install
+
+      - name: Build and install the extension
+        run: |
+          make PG_CONFIG="$PG_PREFIX/bin/pg_config"
+          make install PG_CONFIG="$PG_PREFIX/bin/pg_config"
+
+      - name: Start a test cluster
+        run: |
+          "$PG_PREFIX/bin/initdb" -D /tmp/data -E UTF8 --no-locale
+          echo "shared_preload_libraries = 'immotus_appender'" >> /tmp/data/postgresql.conf
+          "$PG_PREFIX/bin/pg_ctl" -D /tmp/data -l /tmp/data/log start
+
+      - name: Run tests
+        run: make installcheck PG_CONFIG="$PG_PREFIX/bin/pg_config"
+
+      - name: Show test output on failure
+        if: failure()
+        run: |
+          cat regression.diffs output_iso/regression.diffs 2>/dev/null || true
+          tail -n 100 tmp_check/log/* 2>/dev/null || true
