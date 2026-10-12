@@ -88,6 +88,23 @@ SELECT * FROM audit_log WHERE user_id = '...';
 - PostgreSQL 18 (tested against 18.6)
 - development headers (`postgresql-server-dev` on Debian/Ubuntu)
 
+## Testing
+
+`immotus_appender` is an out-of-tree extension: it is built and run outside
+the PostgreSQL source tree. There is no in-tree `make check`; the test suite
+runs only against an **installed** PostgreSQL (binaries, headers and the Perl
+test modules all come from the installation).
+
+```bash
+make install      PG_CONFIG=/path/to/pg_config   # install the extension
+make installcheck PG_CONFIG=/path/to/pg_config
+```
+
+`make installcheck` runs the SQL regression test (`sql/appender.sql`) and the
+TAP test (`t/001_basic.pl`) against a running server. The TAP test is skipped
+unless PostgreSQL was built with `--enable-tap-tests`. Set `PGPORT` if the
+test cluster is not on the default port.
+
 ## License
 
 Apache-2.0. See `LICENSE`.
