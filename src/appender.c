@@ -1443,3 +1443,20 @@ appender_tableam_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(&appender_methods);
 }
+
+/*
+ * Trigger guard for appender_meta: block any direct user DML on the metadata
+ * table.  The extension's own maintenance uses simple_heap_insert/update/
+ * delete, which bypass triggers.
+ */
+PG_FUNCTION_INFO_V1(appender_meta_guard);
+
+Datum
+appender_meta_guard(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("appender_meta is managed by immotus_appender and must not be modified directly")));
+
+	PG_RETURN_POINTER(NULL);		/* unreachable */
+}

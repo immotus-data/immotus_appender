@@ -21,6 +21,9 @@ SELECT relid::regclass AS rel, filenum, eof > 0 AS eof_recorded
   FROM appender_meta
  WHERE relid = 't'::regclass;
 
+-- direct DML on the metadata table is blocked
+DELETE FROM appender_meta;
+
 -- indexes are not supported yet
 CREATE INDEX t_a_idx ON t (a);
 

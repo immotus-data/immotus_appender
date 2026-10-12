@@ -37,6 +37,9 @@ SELECT relid::regclass AS rel, filenum, eof > 0 AS eof_recorded
  t   |       1 | t
 (1 row)
 
+-- direct DML on the metadata table is blocked
+DELETE FROM appender_meta;
+ERROR:  appender_meta is managed by immotus_appender and must not be modified directly
 -- indexes are not supported yet
 CREATE INDEX t_a_idx ON t (a);
 ERROR:  appender: index build not supported

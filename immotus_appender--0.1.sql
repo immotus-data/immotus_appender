@@ -39,3 +39,19 @@ CREATE TABLE appender_meta
     filenum int   NOT NULL,
     eof   bigint NOT NULL
 );
+
+/*
+ * Guard against direct DML: appender_meta is maintained exclusively by the
+ * extension code (simple_heap_insert/update/delete, which bypass triggers).
+ * Any user-level INSERT/UPDATE/DELETE/TRUNCATE would corrupt the EOF metadata
+ * for every appender table, so block it.
+ */
+CREATE FUNCTION appender_meta_guard()
+RETURNS trigger
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+CREATE TRIGGER appender_meta_guard_trigger
+BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON appender_meta
+FOR EACH STATEMENT
+EXECUTE FUNCTION appender_meta_guard();

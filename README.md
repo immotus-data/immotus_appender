@@ -29,7 +29,8 @@ packed back-to-back. A row is addressed by its block offset and its position
 within the block, which is its TID.
 
 A logical EOF per data file is kept in the `appender_meta` table (in the
-extension's schema) and updated once per transaction at commit. Row data is
+extension's schema) and updated once per transaction at commit; direct DML on
+it is blocked by a trigger. Row data is
 not WAL-logged; durability comes
 from fsync'ing dirty data files at commit together with the EOF update, so
 WAL volume is ~0 bytes per row.

@@ -61,8 +61,9 @@ appender_get_eof(Relation rel, Snapshot snapshot)
 	TupleTableSlot *slot;
 	int64		eof = 0;
 
+	/* The metadata table must exist whenever the extension is installed. */
 	if (!OidIsValid(meta_relid))
-		return 0;
+		elog(ERROR, "appender_meta is missing; re-create the extension");
 
 	meta = table_open(meta_relid, AccessShareLock);
 
@@ -184,7 +185,7 @@ appender_reset_eof(Oid relid)
 	bool		found = false;
 
 	if (!OidIsValid(meta_relid))
-		return;					/* extension SQL not installed yet */
+		elog(ERROR, "appender_meta is missing; re-create the extension");
 
 	meta = table_open(meta_relid, RowExclusiveLock);
 
