@@ -46,7 +46,7 @@ PG_MODULE_MAGIC;
  *
  * Row data is not WAL-logged: durability comes from fsync'ing dirty data
  * files at XACT_EVENT_PRE_COMMIT and from the transactional EOF update in
- * immotus_meta.datafiles (a regular heap table, WAL-logged by the standard
+ * appender_meta (a regular heap table, WAL-logged by the standard
  * heap rmgr).  WAL bytes per inserted row are therefore ~0.
  *
  * The rmgr is registered so that WAL-logged appends for replication and PITR
@@ -364,7 +364,7 @@ appender_open_datafile(Relation rel)
  *
  * Data file writes land in the OS page cache only; they are made durable with
  * one FileSync per relation at XACT_EVENT_PRE_COMMIT, i.e. before the commit
- * record (and therefore the datafiles EOF update) is flushed to WAL.  The EOF
+ * record (and therefore the appender_meta EOF update) is flushed to WAL.  The EOF
  * can thus never become durable while the bytes that back it are still only
  * in the page cache.
  *
@@ -421,7 +421,7 @@ appender_flush_dirty(void)
 /* ----------------------------------------------------------------------------
  * In-flight EOF (backend-local, per transaction)
  *
- * The datafiles EOF is updated only once per transaction (at PRE_COMMIT), not
+ * The appender_meta EOF is updated only once per transaction (at PRE_COMMIT), not
  * per row: a per-row heap update would leave one dead tuple per row and turn
  * each insert into an O(n) scan, i.e. O(n^2) overall.  Instead the running
  * EOF is kept here and published once at commit.
@@ -487,7 +487,7 @@ appender_advance_eof(Oid relid, int64 neweof)
 }
 
 /*
- * EOF visible to a reader under snapshot: committed EOF from datafiles, plus
+ * EOF visible to a reader under snapshot: committed EOF from appender_meta, plus
  * our own in-flight appends made at an earlier command id.
  */
 static int64
@@ -507,7 +507,7 @@ appender_visible_eof(Relation rel, Snapshot snapshot)
 	return eof;
 }
 
-/* Publish all in-flight EOFs to datafiles (called at PRE_COMMIT). */
+/* Publish all in-flight EOFs to appender_meta (called at PRE_COMMIT). */
 static void
 appender_flush_eof(void)
 {
@@ -548,7 +548,7 @@ appender_xact_callback(XactEvent event, void *arg)
  *
  * Every row append goes through here.  The block is written at offset (the
  * committed EOF), the data file is queued for a commit-time fsync, and the
- * transactional commit point is the EOF update in datafiles.  No WAL record
+ * transactional commit point is the EOF update in appender_meta.  No WAL record
  * is emitted; WAL-logged appends for replication and PITR can be added here
  * later without changing the insert path.
  */
@@ -790,7 +790,7 @@ appender_finish_bulk_insert(Relation rel, int options)
 
 /*
  * Visibility for append-only data comes entirely from the committed EOF in
- * datafiles, read under the caller's snapshot (appender_get_eof).  MemTuples
+ * appender_meta, read under the caller's snapshot (appender_get_eof).  MemTuples
  * carry no xmin/xmax, so there is no per-tuple visibility test: a tuple is
  * visible iff its block lies below the snapshot's EOF.
  */

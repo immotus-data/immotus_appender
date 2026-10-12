@@ -1,11 +1,12 @@
 /*-------------------------------------------------------------------------
  *
  * appender_metadata.c
- *    EOF metadata (datafiles) for immotus_appender.
+ *    EOF metadata (appender_meta) for immotus_appender.
  *
  * The EOF of each data file is tracked in a heap table owned by the
- * extension: immotus_meta.datafiles (relid oid, filenum int, eof bigint).
- * Because it is an ordinary heap table, MVCC and WAL replay work unchanged.
+ * extension: appender_meta (relid oid, filenum int, eof bigint), located in
+ * the extension's schema.  Because it is an ordinary heap table, MVCC and
+ * WAL replay work unchanged.
  *
  *-------------------------------------------------------------------------
  */
@@ -19,28 +20,31 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "commands/extension.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-#define APPENDER_META_SCHEMA	"immotus_meta"
-#define APPENDER_META_DATAFILES "datafiles"
+#define APPENDER_META_TABLE		"appender_meta"
 
-/* Cached OID of immotus_meta.datafiles. */
-static Oid appender_datafiles_relid = InvalidOid;
+/* Cached OID of appender_meta. */
+static Oid appender_meta_relid = InvalidOid;
 
 static Oid
-appender_datafiles_oid(void)
+appender_meta_oid(void)
 {
-	if (appender_datafiles_relid == InvalidOid)
+	if (appender_meta_relid == InvalidOid)
 	{
-		Oid			nsp = get_namespace_oid(APPENDER_META_SCHEMA, true);
+		Oid			extoid = get_extension_oid("immotus_appender", true);
 
-		if (OidIsValid(nsp))
-			appender_datafiles_relid =
-				get_relname_relid(APPENDER_META_DATAFILES, nsp);
+		if (OidIsValid(extoid))
+		{
+			Oid			nsp = get_extension_schema(extoid);
+
+			appender_meta_relid = get_relname_relid(APPENDER_META_TABLE, nsp);
+		}
 	}
-	return appender_datafiles_relid;
+	return appender_meta_relid;
 }
 
 /*
@@ -50,7 +54,7 @@ appender_datafiles_oid(void)
 int64
 appender_get_eof(Relation rel, Snapshot snapshot)
 {
-	Oid			meta_relid = appender_datafiles_oid();
+	Oid			meta_relid = appender_meta_oid();
 	Oid			target_relid = RelationGetRelid(rel);
 	Relation	meta;
 	TableScanDesc scan;
@@ -101,7 +105,7 @@ appender_get_eof(Relation rel, Snapshot snapshot)
 void
 appender_update_eof(Oid relid, int64 eof)
 {
-	Oid			meta_relid = appender_datafiles_oid();
+	Oid			meta_relid = appender_meta_oid();
 	Oid			target_relid = relid;
 	Relation	meta;
 	ItemPointerData oldtid;
@@ -114,9 +118,9 @@ appender_update_eof(Oid relid, int64 eof)
 	HeapTuple	tup;
 	TU_UpdateIndexes update_indexes;
 
-	/* datafiles must exist (created by the extension SQL). */
+	/* appender_meta must exist (created by the extension SQL). */
 	if (!OidIsValid(meta_relid))
-		elog(ERROR, "immotus_meta.datafiles is missing; re-create the extension");
+		elog(ERROR, "appender_meta is missing; re-create the extension");
 
 	meta = table_open(meta_relid, RowExclusiveLock);
 
@@ -163,7 +167,7 @@ appender_update_eof(Oid relid, int64 eof)
 }
 
 /*
- * Reset the relation's EOF: delete its datafiles row so the next read sees
+ * Reset the relation's EOF: delete its appender_meta row so the next read sees
  * EOF 0.  Called when the relation gets a new relfilenode (TRUNCATE, VACUUM
  * FULL, ALTER TABLE SET TABLESPACE): the old row's EOF refers to the old
  * relfilenode's data file, which no longer exists.
@@ -171,7 +175,7 @@ appender_update_eof(Oid relid, int64 eof)
 void
 appender_reset_eof(Oid relid)
 {
-	Oid			meta_relid = appender_datafiles_oid();
+	Oid			meta_relid = appender_meta_oid();
 	Relation	meta;
 	Snapshot	scan_snap;
 	TableScanDesc scan;

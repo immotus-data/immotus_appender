@@ -18,7 +18,7 @@ DELETE FROM t WHERE a = 1;
 
 -- EOF metadata is recorded
 SELECT relid::regclass AS rel, filenum, eof > 0 AS eof_recorded
-  FROM immotus_meta.datafiles
+  FROM appender_meta
  WHERE relid = 't'::regclass;
 
 -- indexes are not supported yet
