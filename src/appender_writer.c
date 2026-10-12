@@ -1,0 +1,895 @@
+/*-------------------------------------------------------------------------
+ *
+ * appender_writer.c
+ *    Insert path, per-transaction writer state and own-row visibility.
+ *
+ * A writer exists per (transaction, relation storage).  It owns the
+ * segments it claimed, the block buffer and, for every segment, the byte and
+ * row positions reached at the end of each command, so a snapshot taken
+ * inside the transaction sees exactly the rows of earlier commands.
+ *
+ * Subtransactions are handled lazily: the first time a writer is modified at
+ * a deeper nesting level, its buffer is flushed and its position saved, so
+ * a rollback only has to restore positions; blocks written past the restored
+ * position are overwritten by later inserts and are never visible.
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/detoast.h"
+#include "access/htup_details.h"
+#include "access/xact.h"
+#include "appender_datafile.h"
+#include "appender_lifecycle.h"
+#include "appender_metadata.h"
+#include "appender_tid.h"
+#include "appender_writer.h"
+#include "appender_xlog.h"
+#include "common/int.h"
+#include "common/relpath.h"
+#include "pgstat.h"
+#include "storage/fd.h"
+#include "storage/lmgr.h"
+#include "storage/predicate.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
+#include "utils/snapmgr.h"
+#include "utils/wait_event.h"
+
+#define APPENDER_BLOCK_TARGET		(32 * 1024)
+#define APPENDER_BLOCK_MAX_ROWS		4096
+
+int			appender_segment_size_mb = 1024;
+
+typedef struct AppenderCidMark
+{
+	CommandId	cid;
+	int64		eof;
+	uint32		rows;
+} AppenderCidMark;
+
+typedef struct AppenderWSeg
+{
+	int32		segno;
+	bool		is_new;			/* created by this transaction */
+	bool		sealed;
+	bool		sealed_here;	/* sealed by this transaction */
+	bool		dirty;			/* blocks written, needs fsync */
+	int64		start_eof;		/* committed position when claimed */
+	uint32		start_rows;
+	int64		eof;			/* current position, buffered rows included */
+	uint32		rows;
+	AppenderCidMark *marks;
+	int			nmarks;
+	int			maxmarks;
+} AppenderWSeg;
+
+typedef struct AppenderWMark
+{
+	int			level;
+	int			nsegs;
+	int64		eof;
+	uint32		rows;
+	bool		sealed;
+	bool		sealed_here;
+	int			nmarks;
+	AppenderCidMark lastmark;
+} AppenderWMark;
+
+typedef struct AppenderWriter
+{
+	RelFileLocator rlocator;	/* hash key */
+	int			create_level;
+	AppenderWSeg *segs;
+	int			nsegs;
+	int			maxsegs;
+	File		file;
+	int			file_segno;
+	char	   *buf;
+	Size		buflen;
+	Size		bufcap;
+	uint32		bufrows;
+	int			bufnatts;
+	int64		bufoff;
+	uint32		buffirst;
+	AppenderWMark *stack;
+	int			nstack;
+	int			maxstack;
+} AppenderWriter;
+
+static HTAB *appender_writers = NULL;
+
+static void *
+appender_grow(void *array, int *max, Size elemsize)
+{
+	if (array == NULL)
+	{
+		*max = 4;
+		return MemoryContextAlloc(TopTransactionContext, *max * elemsize);
+	}
+	*max *= 2;
+	return repalloc(array, *max * elemsize);
+}
+
+static AppenderWriter *
+appender_get_writer(const RelFileLocator *rlocator, bool create)
+{
+	AppenderWriter *w;
+	bool		found;
+
+	if (appender_writers == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (!create)
+			return NULL;
+		ctl.keysize = sizeof(RelFileLocator);
+		ctl.entrysize = sizeof(AppenderWriter);
+		ctl.hcxt = TopTransactionContext;
+		appender_writers = hash_create("appender writers", 16, &ctl,
+									   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	w = hash_search(appender_writers, rlocator, create ? HASH_ENTER : HASH_FIND,
+					&found);
+	if (w && !found)
+	{
+		memset((char *) w + sizeof(RelFileLocator), 0,
+			   sizeof(AppenderWriter) - sizeof(RelFileLocator));
+		w->create_level = GetCurrentTransactionNestLevel();
+		w->file = -1;
+	}
+	return w;
+}
+
+static inline AppenderWSeg *
+appender_cur_seg(AppenderWriter *w)
+{
+	return w->nsegs > 0 ? &w->segs[w->nsegs - 1] : NULL;
+}
+
+static bool
+appender_seg_full(const AppenderWSeg *seg)
+{
+	int64		limit = (int64) appender_segment_size_mb * 1024 * 1024;
+
+	return seg->eof >= limit ||
+		seg->rows + APPENDER_BLOCK_MAX_ROWS > APPENDER_ROWS_PER_SEGMENT;
+}
+
+static void
+appender_close_file(AppenderWriter *w)
+{
+	if (w->file >= 0)
+		FileClose(w->file);
+	w->file = -1;
+	w->file_segno = 0;
+}
+
+static File
+appender_writer_file(AppenderWriter *w, int segno)
+{
+	if (w->file < 0 || w->file_segno != segno)
+	{
+		appender_close_file(w);
+		w->file = appender_seg_open(&w->rlocator, segno);
+		w->file_segno = segno;
+	}
+	return w->file;
+}
+
+/*
+ * Segment locks are transaction-scoped object locks on (appender_meta,
+ * relfilenode, segno).  They are only ever taken without waiting.
+ */
+static void
+appender_seg_locktag(LOCKTAG *tag, const RelFileLocator *rlocator, int segno)
+{
+	SET_LOCKTAG_OBJECT(*tag, rlocator->dbOid, appender_meta_relid(false),
+					   rlocator->relNumber, (uint16) segno);
+}
+
+static bool
+appender_seg_trylock(const RelFileLocator *rlocator, int segno)
+{
+	LOCKTAG		tag;
+
+	appender_seg_locktag(&tag, rlocator, segno);
+	return LockAcquire(&tag, ExclusiveLock, false, true) != LOCKACQUIRE_NOT_AVAIL;
+}
+
+static void
+appender_seg_unlock(const RelFileLocator *rlocator, int segno)
+{
+	LOCKTAG		tag;
+
+	appender_seg_locktag(&tag, rlocator, segno);
+	LockRelease(&tag, ExclusiveLock, false);
+}
+
+static bool
+appender_writer_has_seg(AppenderWriter *w, int segno)
+{
+	for (int i = 0; i < w->nsegs; i++)
+		if (w->segs[i].segno == segno)
+			return true;
+	return false;
+}
+
+static AppenderWSeg *
+appender_add_seg(AppenderWriter *w, int segno, bool is_new, int64 eof,
+				 uint32 rows)
+{
+	AppenderWSeg *seg;
+
+	if (w->nsegs == w->maxsegs)
+		w->segs = appender_grow(w->segs, &w->maxsegs, sizeof(AppenderWSeg));
+	seg = &w->segs[w->nsegs++];
+	memset(seg, 0, sizeof(*seg));
+	seg->segno = segno;
+	seg->is_new = is_new;
+	seg->start_eof = seg->eof = eof;
+	seg->start_rows = seg->rows = rows;
+	return seg;
+}
+
+/*
+ * Claim a segment to append to: an open segment no other transaction holds,
+ * or else a new one.  Positions are re-read after the lock is taken, because
+ * the previous holder may have committed in between.
+ */
+static void
+appender_claim_segment(AppenderWriter *w)
+{
+	AppenderSegment *segs;
+	int			nsegs = appender_meta_segments(&w->rlocator, GetLatestSnapshot(),
+											   &segs);
+	int			maxsegno = APPENDER_FIRST_SEGNO - 1;
+	AppenderSegment cur;
+
+	for (int i = 0; i < nsegs; i++)
+		maxsegno = Max(maxsegno, segs[i].segno);
+	for (int i = 0; i < w->nsegs; i++)
+		maxsegno = Max(maxsegno, w->segs[i].segno);
+
+	for (int i = 0; i < nsegs; i++)
+	{
+		int			segno = segs[i].segno;
+
+		if (segs[i].state != APPENDER_SEG_OPEN ||
+			appender_writer_has_seg(w, segno) ||
+			!appender_seg_trylock(&w->rlocator, segno))
+			continue;
+
+		if (appender_meta_get(&w->rlocator, segno, GetLatestSnapshot(), &cur) &&
+			cur.state == APPENDER_SEG_OPEN)
+		{
+			AppenderWSeg *seg = appender_add_seg(w, segno, false, cur.eof,
+												 (uint32) cur.rowcount);
+
+			if (!appender_seg_full(seg))
+			{
+				pfree(segs);
+				return;
+			}
+			/* left full by its last writer: seal it on our way past */
+			seg->sealed = seg->sealed_here = true;
+			continue;
+		}
+		appender_seg_unlock(&w->rlocator, segno);
+	}
+	pfree(segs);
+
+	for (int segno = maxsegno + 1;; segno++)
+	{
+		if (segno > APPENDER_MAX_SEGNO)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("appender relation has too many segments")));
+
+		if (!appender_seg_trylock(&w->rlocator, segno))
+			continue;
+
+		if (appender_meta_get(&w->rlocator, segno, GetLatestSnapshot(), &cur))
+		{
+			if (cur.state == APPENDER_SEG_OPEN)
+			{
+				AppenderWSeg *seg = appender_add_seg(w, segno, false, cur.eof,
+													 (uint32) cur.rowcount);
+
+				if (!appender_seg_full(seg))
+					return;
+				seg->sealed = seg->sealed_here = true;
+				continue;
+			}
+			appender_seg_unlock(&w->rlocator, segno);
+			continue;
+		}
+
+		appender_close_file(w);
+		w->file = appender_seg_create(&w->rlocator, segno);
+		w->file_segno = segno;
+		appender_xlog_create(&w->rlocator, segno);
+		appender_add_seg(w, segno, true, APPENDER_SEG_DATA_START, 0);
+		return;
+	}
+}
+
+static void
+appender_buf_flush(AppenderWriter *w)
+{
+	AppenderWSeg *seg = appender_cur_seg(w);
+	AppenderBlockHeader hdr;
+	File		file;
+
+	if (w->bufrows == 0)
+		return;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.version = APPENDER_FORMAT_VERSION;
+	hdr.kind = APPENDER_BLOCK_KIND_DATA;
+	hdr.rowcount = w->bufrows;
+	hdr.first_rownum = w->buffirst;
+	hdr.datalen = hdr.rawlen = (uint32) w->buflen;
+	hdr.natts = (uint16) w->bufnatts;
+	hdr.codec = APPENDER_CODEC_NONE;
+
+	file = appender_writer_file(w, seg->segno);
+	appender_seg_write_block(file, w->bufoff, &hdr, w->buf);
+	appender_xlog_block(&w->rlocator, seg->segno, w->bufoff, &hdr, w->buf);
+	FileWriteback(file, w->bufoff, appender_block_size(&hdr),
+				  WAIT_EVENT_DATA_FILE_FLUSH);
+
+	seg->dirty = true;
+	w->buflen = 0;
+	w->bufrows = 0;
+}
+
+/* Save the writer's position the first time it changes at a new level. */
+static void
+appender_writer_savepoint(AppenderWriter *w)
+{
+	int			level = GetCurrentTransactionNestLevel();
+	int			top = w->nstack > 0 ? w->stack[w->nstack - 1].level : w->create_level;
+	AppenderWSeg *seg;
+	AppenderWMark *m;
+
+	if (level <= top)
+		return;
+
+	appender_buf_flush(w);
+
+	if (w->nstack == w->maxstack)
+		w->stack = appender_grow(w->stack, &w->maxstack, sizeof(AppenderWMark));
+	m = &w->stack[w->nstack++];
+	memset(m, 0, sizeof(*m));
+	m->level = level;
+	m->nsegs = w->nsegs;
+	seg = appender_cur_seg(w);
+	if (seg)
+	{
+		m->eof = seg->eof;
+		m->rows = seg->rows;
+		m->sealed = seg->sealed;
+		m->sealed_here = seg->sealed_here;
+		m->nmarks = seg->nmarks;
+		if (seg->nmarks > 0)
+			m->lastmark = seg->marks[seg->nmarks - 1];
+	}
+}
+
+static void
+appender_mark_cid(AppenderWSeg *seg, CommandId cid)
+{
+	AppenderCidMark *mark;
+
+	if (seg->nmarks > 0 && seg->marks[seg->nmarks - 1].cid == cid)
+		mark = &seg->marks[seg->nmarks - 1];
+	else
+	{
+		if (seg->nmarks == seg->maxmarks)
+			seg->marks = appender_grow(seg->marks, &seg->maxmarks,
+									   sizeof(AppenderCidMark));
+		mark = &seg->marks[seg->nmarks++];
+		mark->cid = cid;
+	}
+	mark->eof = seg->eof;
+	mark->rows = seg->rows;
+}
+
+/* Begin a new block, moving to another segment if the current one is full. */
+static void
+appender_buf_start(AppenderWriter *w, int natts)
+{
+	AppenderWSeg *seg = appender_cur_seg(w);
+
+	if (seg != NULL && !seg->sealed && appender_seg_full(seg))
+		seg->sealed = seg->sealed_here = true;
+	if (seg == NULL || seg->sealed)
+	{
+		appender_claim_segment(w);
+		seg = appender_cur_seg(w);
+	}
+
+	w->bufoff = seg->eof;
+	w->buffirst = seg->rows;
+	w->bufnatts = natts;
+}
+
+void
+appender_writer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	AppenderWriter *w = appender_get_writer(&rel->rd_locator, true);
+	Datum	   *values;
+	bool	   *isnull;
+	Datum	   *detoasted = NULL;
+	MemTuple	mtup;
+	uint32		mtsize;
+	AppenderWSeg *seg;
+
+	CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
+	appender_writer_savepoint(w);
+
+	slot_getallattrs(slot);
+	values = slot->tts_values;
+	isnull = slot->tts_isnull;
+
+	/* MemTuples must be self-contained: fetch out-of-line values. */
+	for (int i = 0; i < desc->natts; i++)
+	{
+		struct varlena *v;
+
+		if (isnull[i] || TupleDescAttr(desc, i)->attlen != -1)
+			continue;
+		v = (struct varlena *) DatumGetPointer(values[i]);
+		if (!VARATT_IS_EXTERNAL(v) || VARATT_IS_EXTERNAL_EXPANDED(v))
+			continue;
+		if (detoasted == NULL)
+		{
+			detoasted = palloc(desc->natts * sizeof(Datum));
+			memcpy(detoasted, values, desc->natts * sizeof(Datum));
+			values = detoasted;
+		}
+		values[i] = PointerGetDatum(detoast_external_attr(v));
+	}
+
+	mtup = memtuple_form(appender_binding(rel, desc->natts), values, isnull);
+	mtsize = memtuple_get_size(mtup);
+
+	if (w->bufrows > 0 &&
+		(w->bufnatts != desc->natts ||
+		 w->buflen + mtsize > APPENDER_BLOCK_TARGET ||
+		 w->bufrows >= APPENDER_BLOCK_MAX_ROWS))
+		appender_buf_flush(w);
+	if (w->bufrows == 0)
+		appender_buf_start(w, desc->natts);
+
+	if (w->buflen + mtsize > w->bufcap)
+	{
+		Size		newcap = Max(w->buflen + mtsize, (Size) APPENDER_BLOCK_TARGET);
+
+		w->buf = w->buf ? repalloc(w->buf, newcap)
+			: MemoryContextAlloc(TopTransactionContext, newcap);
+		w->bufcap = newcap;
+	}
+	memcpy(w->buf + w->buflen, mtup, mtsize);
+	w->buflen += mtsize;
+	w->bufrows++;
+
+	seg = appender_cur_seg(w);
+	seg->eof = w->bufoff + sizeof(AppenderBlockHeader) + w->buflen;
+	seg->rows = w->buffirst + w->bufrows;
+	appender_mark_cid(seg, cid);
+
+	appender_tid_set(&slot->tts_tid, seg->segno, seg->rows - 1);
+	slot->tts_tableOid = RelationGetRelid(rel);
+
+	pfree(mtup);
+	if (detoasted)
+		pfree(detoasted);
+	pgstat_count_heap_insert(rel, 1);
+}
+
+/* Write out buffered rows so that a scan of the storage can read them. */
+void
+appender_writer_flush(const RelFileLocator *rlocator)
+{
+	AppenderWriter *w = appender_get_writer(rlocator, false);
+
+	if (w)
+		appender_buf_flush(w);
+}
+
+static void
+appender_unlink_new_segs(AppenderWriter *w, int from)
+{
+	for (int i = from; i < w->nsegs; i++)
+	{
+		if (!w->segs[i].is_new)
+			continue;
+		if (w->file_segno == w->segs[i].segno)
+			appender_close_file(w);
+		appender_seg_unlink(&w->rlocator, w->segs[i].segno);
+		appender_xlog_unlink(&w->rlocator, w->segs[i].segno);
+	}
+}
+
+/* Forget a storage's writer whose segments were just removed. */
+void
+appender_writer_discard(const RelFileLocator *rlocator)
+{
+	AppenderWriter *w = appender_get_writer(rlocator, false);
+
+	if (w)
+	{
+		appender_close_file(w);
+		hash_search(appender_writers, rlocator, HASH_REMOVE, NULL);
+	}
+}
+
+/*
+ * This backend's own appends to a storage visible to a snapshot with the
+ * given command id: rows of commands before curcid.
+ */
+int
+appender_own_segments(const RelFileLocator *rlocator, CommandId curcid,
+					   AppenderScanSeg **segs)
+{
+	AppenderWriter *w = appender_get_writer(rlocator, false);
+	AppenderScanSeg *out;
+	int			n = 0;
+
+	*segs = NULL;
+	if (w == NULL || w->nsegs == 0)
+		return 0;
+
+	out = palloc0(w->nsegs * sizeof(AppenderScanSeg));
+	for (int i = 0; i < w->nsegs; i++)
+	{
+		AppenderWSeg *seg = &w->segs[i];
+		AppenderCidMark *mark = NULL;
+
+		for (int j = seg->nmarks - 1; j >= 0; j--)
+		{
+			if (seg->marks[j].cid < curcid)
+			{
+				mark = &seg->marks[j];
+				break;
+			}
+		}
+		if (mark == NULL || mark->rows == seg->start_rows)
+			continue;
+
+		out[n].segno = seg->segno;
+		out[n].own_off = seg->start_eof;
+		out[n].own_eof = mark->eof;
+		out[n].own_first = seg->start_rows;
+		out[n].own_rows = mark->rows - seg->start_rows;
+		n++;
+	}
+	*segs = out;
+	return n;
+}
+
+static int
+appender_scanseg_cmp(const void *a, const void *b)
+{
+	return pg_cmp_s32(((const AppenderScanSeg *) a)->segno,
+					  ((const AppenderScanSeg *) b)->segno);
+}
+
+/*
+ * Segments of a storage as seen by snapshot: committed rows from the
+ * manifest merged with this backend's own appends.
+ */
+int
+appender_visible_segments(const RelFileLocator *rlocator, Snapshot snapshot,
+						  const AppenderScanSeg *own, int nown,
+						  AppenderScanSeg **segs)
+{
+	AppenderSegment *meta;
+	int			nmeta = appender_meta_segments(rlocator, snapshot, &meta);
+	AppenderScanSeg *out = palloc0((nmeta + nown + 1) * sizeof(AppenderScanSeg));
+	int			n = 0;
+
+	for (int i = 0; i < nmeta; i++)
+	{
+		out[n].segno = meta[i].segno;
+		out[n].eof = meta[i].eof;
+		out[n].rows = (uint32) meta[i].rowcount;
+		n++;
+	}
+	pfree(meta);
+
+	for (int j = 0; j < nown; j++)
+	{
+		AppenderScanSeg *dst = NULL;
+
+		for (int i = 0; i < nmeta; i++)
+		{
+			if (out[i].segno == own[j].segno)
+			{
+				dst = &out[i];
+				break;
+			}
+		}
+		if (dst == NULL)
+		{
+			dst = &out[n++];
+			dst->segno = own[j].segno;
+			dst->eof = APPENDER_SEG_DATA_START;
+			dst->rows = 0;
+		}
+		dst->own_off = own[j].own_off;
+		dst->own_eof = own[j].own_eof;
+		dst->own_first = own[j].own_first;
+		dst->own_rows = own[j].own_rows;
+	}
+
+	if (n > 1)
+		qsort(out, n, sizeof(AppenderScanSeg), appender_scanseg_cmp);
+	*segs = out;
+	return n;
+}
+
+bool
+appender_writer_active(void)
+{
+	return appender_writers != NULL && hash_get_num_entries(appender_writers) > 0;
+}
+
+/*
+ * Make this transaction's appends durable and publish them: write pending
+ * blocks, fsync the touched segments (and the directory of new ones), then
+ * store the new segment positions.  The commit record that follows makes the
+ * manifest rows, and so the rows they cover, visible atomically.
+ */
+void
+appender_writer_pre_commit(void)
+{
+	HASH_SEQ_STATUS status;
+	AppenderWriter *w;
+
+	if (appender_writers == NULL)
+		return;
+
+	hash_seq_init(&status, appender_writers);
+	while ((w = hash_seq_search(&status)) != NULL)
+	{
+		bool		newfile = false;
+
+		if (appender_storage_dropped(&w->rlocator))
+			continue;
+
+		appender_buf_flush(w);
+
+		for (int i = 0; i < w->nsegs; i++)
+		{
+			AppenderWSeg *seg = &w->segs[i];
+
+			if (seg->dirty)
+			{
+				appender_seg_sync(appender_writer_file(w, seg->segno));
+				appender_xlog_sync(&w->rlocator, seg->segno);
+			}
+			newfile |= seg->is_new;
+		}
+
+		if (newfile)
+		{
+			char	   *dirpath = GetDatabasePath(w->rlocator.dbOid,
+												  w->rlocator.spcOid);
+
+			fsync_fname(dirpath, true);
+			pfree(dirpath);
+		}
+
+		for (int i = 0; i < w->nsegs; i++)
+		{
+			AppenderWSeg *seg = &w->segs[i];
+			AppenderSegment row;
+
+			if (!seg->is_new && !seg->sealed_here && seg->rows == seg->start_rows)
+				continue;
+
+			row.segno = seg->segno;
+			row.state = seg->sealed ? APPENDER_SEG_SEALED : APPENDER_SEG_OPEN;
+			row.eof = seg->eof;
+			row.rowcount = seg->rows;
+			appender_meta_store(&w->rlocator, &row);
+		}
+	}
+}
+
+void
+appender_writer_end(bool isCommit)
+{
+	HASH_SEQ_STATUS status;
+	AppenderWriter *w;
+
+	if (appender_writers == NULL)
+		return;
+
+	hash_seq_init(&status, appender_writers);
+	while ((w = hash_seq_search(&status)) != NULL)
+	{
+		if (!isCommit)
+			appender_unlink_new_segs(w, 0);
+		appender_close_file(w);
+	}
+	appender_writers = NULL;
+}
+
+static void
+appender_writer_restore(AppenderWriter *w, const AppenderWMark *m)
+{
+	w->buflen = 0;
+	w->bufrows = 0;
+
+	appender_unlink_new_segs(w, m->nsegs);
+	w->nsegs = m->nsegs;
+	if (w->file_segno != 0 && !appender_writer_has_seg(w, w->file_segno))
+		appender_close_file(w);
+
+	if (w->nsegs > 0)
+	{
+		AppenderWSeg *seg = appender_cur_seg(w);
+
+		seg->eof = m->eof;
+		seg->rows = m->rows;
+		seg->sealed = m->sealed;
+		seg->sealed_here = m->sealed_here;
+		seg->nmarks = m->nmarks;
+		if (m->nmarks > 0)
+			seg->marks[m->nmarks - 1] = m->lastmark;
+	}
+}
+
+void
+appender_writer_subxact_end(bool isCommit)
+{
+	int			level = GetCurrentTransactionNestLevel();
+	HASH_SEQ_STATUS status;
+	AppenderWriter *w;
+	List	   *dead = NIL;
+	ListCell   *lc;
+
+	if (appender_writers == NULL)
+		return;
+
+	hash_seq_init(&status, appender_writers);
+	while ((w = hash_seq_search(&status)) != NULL)
+	{
+		if (isCommit)
+		{
+			if (w->create_level == level)
+				w->create_level = level - 1;
+			if (w->nstack > 0 && w->stack[w->nstack - 1].level == level)
+			{
+				int			below = w->nstack > 1 ? w->stack[w->nstack - 2].level
+					: w->create_level;
+
+				if (below >= level - 1)
+					w->nstack--;
+				else
+					w->stack[w->nstack - 1].level = level - 1;
+			}
+			continue;
+		}
+
+		if (w->create_level >= level)
+		{
+			appender_unlink_new_segs(w, 0);
+			appender_close_file(w);
+			dead = lappend(dead, &w->rlocator);
+			continue;
+		}
+
+		{
+			AppenderWMark *restore = NULL;
+
+			while (w->nstack > 0 && w->stack[w->nstack - 1].level >= level)
+				restore = &w->stack[--w->nstack];
+			if (restore)
+				appender_writer_restore(w, restore);
+		}
+	}
+
+	foreach(lc, dead)
+		hash_search(appender_writers, lfirst(lc), HASH_REMOVE, NULL);
+	list_free(dead);
+}
+
+/*
+ * MemTuple bindings, one per (relation, natts): blocks written before an
+ * ALTER TABLE ADD COLUMN keep the narrower layout.
+ */
+typedef struct AppenderBindKey
+{
+	Oid			relid;
+	int			natts;
+} AppenderBindKey;
+
+typedef struct AppenderBindEntry
+{
+	AppenderBindKey key;
+	MemTupleBinding *bind;
+} AppenderBindEntry;
+
+static HTAB *appender_bindings = NULL;
+
+MemTupleBinding *
+appender_binding(Relation rel, int natts)
+{
+	AppenderBindKey key;
+	AppenderBindEntry *entry;
+	bool		found;
+
+	if (appender_bindings == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(AppenderBindKey);
+		ctl.entrysize = sizeof(AppenderBindEntry);
+		ctl.hcxt = CacheMemoryContext;
+		appender_bindings = hash_create("appender bindings", 64, &ctl,
+										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	memset(&key, 0, sizeof(key));
+	key.relid = RelationGetRelid(rel);
+	key.natts = natts;
+	entry = hash_search(appender_bindings, &key, HASH_ENTER, &found);
+	if (!found)
+	{
+		MemoryContext oldctx = MemoryContextSwitchTo(CacheMemoryContext);
+
+		entry->bind = NULL;
+		PG_TRY();
+		{
+			entry->bind = create_memtuple_binding(
+				CreateTupleDescTruncatedCopy(RelationGetDescr(rel), natts));
+		}
+		PG_FINALLY();
+		{
+			MemoryContextSwitchTo(oldctx);
+			if (entry->bind == NULL)
+				hash_search(appender_bindings, &key, HASH_REMOVE, NULL);
+		}
+		PG_END_TRY();
+	}
+	return entry->bind;
+}
+
+/* Relcache invalidation: drop bindings of relid, or all of them. */
+void
+appender_binding_forget(Oid relid)
+{
+	HASH_SEQ_STATUS status;
+	AppenderBindEntry *entry;
+
+	if (appender_bindings == NULL)
+		return;
+
+	hash_seq_init(&status, appender_bindings);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		if (OidIsValid(relid) && entry->key.relid != relid)
+			continue;
+		FreeTupleDesc(entry->bind->tupdesc);
+		destroy_memtuple_binding(entry->bind);
+		hash_search(appender_bindings, &entry->key, HASH_REMOVE, NULL);
+	}
+}
+
+/* Deform a MemTuple formed with natts attributes into a slot of desc. */
+void
+appender_deform(MemTuple mtup, MemTupleBinding *bind, int natts,
+				TupleDesc desc, TupleTableSlot *slot)
+{
+	memtuple_deform(mtup, bind, slot->tts_values, slot->tts_isnull);
+	for (int i = natts; i < desc->natts; i++)
+		slot->tts_values[i] = getmissingattr(desc, i + 1, &slot->tts_isnull[i]);
+}

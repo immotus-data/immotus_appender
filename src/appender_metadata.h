@@ -1,33 +1,40 @@
 /*-------------------------------------------------------------------------
  *
  * appender_metadata.h
- *    EOF metadata (appender_meta) for immotus_appender.
+ *    Segment manifest of appender tables.
  *
- * The appender_meta table is a regular heap table owned by the extension.  A
- * reader using its own snapshot sees the EOF committed as of that snapshot,
- * hence exactly the committed prefix of the data file.
+ * appender_meta holds one row per segment of a relation storage, keyed by
+ * (tablespace, relfilenode, segno).  It is an ordinary heap table, so a
+ * reader sees the segment EOFs committed as of its snapshot, and the rows
+ * follow the storage through TRUNCATE and table rewrites.
  *
  *-------------------------------------------------------------------------
  */
 #ifndef APPENDER_METADATA_H
 #define APPENDER_METADATA_H
 
-#include "postgres.h"
-#include "utils/rel.h"
+#include "storage/relfilelocator.h"
 #include "utils/snapshot.h"
 
-/* Logical EOF of the relation's datafile as visible under the given snapshot. */
-extern int64 appender_get_eof(Relation rel, Snapshot snapshot);
+#define APPENDER_SEG_OPEN		0
+#define APPENDER_SEG_SEALED		1
 
-/*
- * Record a new EOF for the relation (insert or update the appender_meta row).
- * Called once per transaction at PRE_COMMIT; the row update commits/rolls back
- * with it, so an aborted insert leaves the old EOF and its datafile tail is
- * ignored.
- */
-extern void appender_update_eof(Oid relid, int64 eof);
+typedef struct AppenderSegment
+{
+	int32		segno;
+	int16		state;
+	int64		eof;			/* committed logical end of the segment file */
+	int64		rowcount;		/* committed rows in the segment */
+} AppenderSegment;
 
-/* Drop the relation's appender_meta row (EOF resets to 0 for a new relfilenode). */
-extern void appender_reset_eof(Oid relid);
+extern Oid	appender_meta_relid(bool missing_ok);
+extern void appender_meta_invalidate(Oid relid);
+extern int	appender_meta_segments(const RelFileLocator *rlocator,
+								   Snapshot snapshot, AppenderSegment **segs);
+extern bool appender_meta_get(const RelFileLocator *rlocator, int segno,
+							  Snapshot snapshot, AppenderSegment *seg);
+extern void appender_meta_store(const RelFileLocator *rlocator,
+								const AppenderSegment *seg);
+extern void appender_meta_delete(const RelFileLocator *rlocator);
 
 #endif							/* APPENDER_METADATA_H */

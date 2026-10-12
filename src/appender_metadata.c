@@ -1,215 +1,248 @@
 /*-------------------------------------------------------------------------
  *
  * appender_metadata.c
- *    EOF metadata (appender_meta) for immotus_appender.
+ *    Segment manifest of appender tables.
  *
- * The EOF of each data file is tracked in a heap table owned by the
- * extension: appender_meta (relid oid, filenum int, eof bigint), located in
- * the extension's schema.  Because it is an ordinary heap table, MVCC and
- * WAL replay work unchanged.
+ * The manifest is maintained with simple_heap_insert/update/delete, which
+ * bypass triggers and index maintenance; the table therefore has no indexes
+ * and is read with a sequential scan.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "appender_metadata.h"
-#include "appender_datafile.h"
-
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
-#include "access/xact.h"
-#include "catalog/namespace.h"
+#include "access/tableam.h"
+#include "appender_datafile.h"
+#include "appender_metadata.h"
 #include "commands/extension.h"
+#include "common/int.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
-#define APPENDER_META_TABLE		"appender_meta"
+#define Natts_appender_meta				7
+#define Anum_appender_meta_spcoid		1
+#define Anum_appender_meta_relfilenode	2
+#define Anum_appender_meta_segno		3
+#define Anum_appender_meta_state		4
+#define Anum_appender_meta_eof			5
+#define Anum_appender_meta_rowcount		6
+#define Anum_appender_meta_version		7
 
-/* Cached OID of appender_meta. */
-static Oid appender_meta_relid = InvalidOid;
+static Oid	appender_meta_oid = InvalidOid;
 
-static Oid
-appender_meta_oid(void)
+Oid
+appender_meta_relid(bool missing_ok)
 {
-	if (appender_meta_relid == InvalidOid)
+	if (!OidIsValid(appender_meta_oid))
 	{
 		Oid			extoid = get_extension_oid("immotus_appender", true);
 
 		if (OidIsValid(extoid))
-		{
-			Oid			nsp = get_extension_schema(extoid);
-
-			appender_meta_relid = get_relname_relid(APPENDER_META_TABLE, nsp);
-		}
+			appender_meta_oid = get_relname_relid("appender_meta",
+												  get_extension_schema(extoid));
 	}
-	return appender_meta_relid;
+
+	if (!OidIsValid(appender_meta_oid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("appender_meta is missing"),
+				 errhint("Re-create the immotus_appender extension.")));
+
+	return appender_meta_oid;
+}
+
+void
+appender_meta_invalidate(Oid relid)
+{
+	if (!OidIsValid(relid) || relid == appender_meta_oid)
+		appender_meta_oid = InvalidOid;
+}
+
+static bool
+appender_meta_row(HeapTuple tup, TupleDesc desc, const RelFileLocator *rlocator,
+				  AppenderSegment *seg)
+{
+	Datum		values[Natts_appender_meta];
+	bool		nulls[Natts_appender_meta];
+
+	heap_deform_tuple(tup, desc, values, nulls);
+
+	if (DatumGetObjectId(values[Anum_appender_meta_spcoid - 1]) != rlocator->spcOid ||
+		DatumGetObjectId(values[Anum_appender_meta_relfilenode - 1]) != rlocator->relNumber)
+		return false;
+
+	seg->segno = DatumGetInt32(values[Anum_appender_meta_segno - 1]);
+	seg->state = DatumGetInt16(values[Anum_appender_meta_state - 1]);
+	seg->eof = DatumGetInt64(values[Anum_appender_meta_eof - 1]);
+	seg->rowcount = DatumGetInt64(values[Anum_appender_meta_rowcount - 1]);
+	return true;
+}
+
+static int
+appender_segment_cmp(const void *a, const void *b)
+{
+	return pg_cmp_s32(((const AppenderSegment *) a)->segno,
+					  ((const AppenderSegment *) b)->segno);
 }
 
 /*
- * Read the relation's EOF as visible under the given snapshot.
- * Column layout: 1 = relid oid, 2 = filenum int, 3 = eof bigint.
+ * Segments of a storage visible under snapshot, sorted by segno.  Returns the
+ * count; *segs is palloc'd in the current memory context.
  */
-int64
-appender_get_eof(Relation rel, Snapshot snapshot)
+int
+appender_meta_segments(const RelFileLocator *rlocator, Snapshot snapshot,
+					   AppenderSegment **segs)
 {
-	Oid			meta_relid = appender_meta_oid();
-	Oid			target_relid = RelationGetRelid(rel);
-	Relation	meta;
-	TableScanDesc scan;
-	TupleTableSlot *slot;
-	int64		eof = 0;
+	Relation	meta = table_open(appender_meta_relid(false), AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(meta);
+	Snapshot	snap = RegisterSnapshot(snapshot);
+	TableScanDesc scan = table_beginscan(meta, snap, 0, NULL);
+	HeapTuple	tup;
+	int			n = 0;
+	int			cap = 8;
+	AppenderSegment *out = palloc(cap * sizeof(AppenderSegment));
 
-	/* The metadata table must exist whenever the extension is installed. */
-	if (!OidIsValid(meta_relid))
-		elog(ERROR, "appender_meta is missing; re-create the extension");
-
-	meta = table_open(meta_relid, AccessShareLock);
-
-	/*
-	 * HeapTupleSatisfiesMVCC asserts that the snapshot is registered (or
-	 * active).  Callers may hand us an unregistered snapshot such as the
-	 * secondary snapshot returned by GetLatestSnapshot(), so register it for
-	 * the duration of the scan.
-	 */
-	snapshot = RegisterSnapshot(snapshot);
-	scan = table_beginscan(meta, snapshot, 0, NULL);
-	slot = table_slot_create(meta, NULL);
-
-	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
-		bool		isnull;
-		Oid			rowrelid = DatumGetObjectId(slot_getattr(slot, 1, &isnull));
-
-		if (rowrelid == target_relid)
+		if (n == cap)
 		{
-			int64		roweof = DatumGetInt64(slot_getattr(slot, 3, &isnull));
-
-			if (roweof > eof)
-				eof = roweof;	/* tolerate stale duplicate rows */
+			cap *= 2;
+			out = repalloc(out, cap * sizeof(AppenderSegment));
 		}
+		if (appender_meta_row(tup, desc, rlocator, &out[n]))
+			n++;
 	}
 
-	ExecDropSingleTupleTableSlot(slot);
 	table_endscan(scan);
-	UnregisterSnapshot(snapshot);
+	UnregisterSnapshot(snap);
 	table_close(meta, AccessShareLock);
 
-	return eof;
+	if (n > 1)
+		qsort(out, n, sizeof(AppenderSegment), appender_segment_cmp);
+
+	*segs = out;
+	return n;
 }
 
-/*
- * Insert or update the relation's EOF row.  Must run inside the inserting
- * transaction so that the change is atomic with it.
- */
-void
-appender_update_eof(Oid relid, int64 eof)
+bool
+appender_meta_get(const RelFileLocator *rlocator, int segno, Snapshot snapshot,
+				  AppenderSegment *seg)
 {
-	Oid			meta_relid = appender_meta_oid();
-	Oid			target_relid = relid;
-	Relation	meta;
-	ItemPointerData oldtid;
+	AppenderSegment *segs;
+	int			n = appender_meta_segments(rlocator, snapshot, &segs);
 	bool		found = false;
-	TableScanDesc scan;
-	TupleTableSlot *slot;
-	Snapshot	scan_snap;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
-	HeapTuple	tup;
-	TU_UpdateIndexes update_indexes;
 
-	/* appender_meta must exist (created by the extension SQL). */
-	if (!OidIsValid(meta_relid))
-		elog(ERROR, "appender_meta is missing; re-create the extension");
-
-	meta = table_open(meta_relid, RowExclusiveLock);
-
-	/* Find an existing row (latest snapshot, registered for the scan). */
-	scan_snap = RegisterSnapshot(GetLatestSnapshot());
-	scan = table_beginscan(meta, scan_snap, 0, NULL);
-	slot = table_slot_create(meta, NULL);
-	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	for (int i = 0; i < n; i++)
 	{
-		bool		isnull;
-		Oid			rowrelid = DatumGetObjectId(slot_getattr(slot, 1, &isnull));
-
-		if (rowrelid == target_relid)
+		if (segs[i].segno == segno)
 		{
-			oldtid = slot->tts_tid;
+			*seg = segs[i];
 			found = true;
 			break;
 		}
 	}
-	ExecDropSingleTupleTableSlot(slot);
+	pfree(segs);
+	return found;
+}
+
+/*
+ * Insert or update a segment's row.  The caller holds the segment lock, so
+ * no other transaction updates the same row concurrently.
+ */
+void
+appender_meta_store(const RelFileLocator *rlocator, const AppenderSegment *seg)
+{
+	Relation	meta = table_open(appender_meta_relid(false), RowExclusiveLock);
+	TupleDesc	desc = RelationGetDescr(meta);
+	Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+	TableScanDesc scan = table_beginscan(meta, snap, 0, NULL);
+	HeapTuple	tup;
+	ItemPointerData oldtid;
+	bool		found = false;
+	Datum		values[Natts_appender_meta];
+	bool		nulls[Natts_appender_meta] = {0};
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		AppenderSegment row;
+
+		if (appender_meta_row(tup, desc, rlocator, &row) && row.segno == seg->segno)
+		{
+			oldtid = tup->t_self;
+			found = true;
+			break;
+		}
+	}
 	table_endscan(scan);
-	UnregisterSnapshot(scan_snap);
+	UnregisterSnapshot(snap);
 
-	values[0] = ObjectIdGetDatum(target_relid);
-	values[1] = Int32GetDatum(APPENDER_DATAFILE_FIRST_FILENUM);
-	values[2] = Int64GetDatum(eof);
+	values[Anum_appender_meta_spcoid - 1] = ObjectIdGetDatum(rlocator->spcOid);
+	values[Anum_appender_meta_relfilenode - 1] = ObjectIdGetDatum(rlocator->relNumber);
+	values[Anum_appender_meta_segno - 1] = Int32GetDatum(seg->segno);
+	values[Anum_appender_meta_state - 1] = Int16GetDatum(seg->state);
+	values[Anum_appender_meta_eof - 1] = Int64GetDatum(seg->eof);
+	values[Anum_appender_meta_rowcount - 1] = Int64GetDatum(seg->rowcount);
+	values[Anum_appender_meta_version - 1] = Int16GetDatum(APPENDER_FORMAT_VERSION);
 
-	tup = heap_form_tuple(RelationGetDescr(meta), values, nulls);
-
+	tup = heap_form_tuple(desc, values, nulls);
 	if (found)
+	{
+		TU_UpdateIndexes update_indexes;
+
 		simple_heap_update(meta, &oldtid, tup, &update_indexes);
+	}
 	else
 		simple_heap_insert(meta, tup);
-
 	heap_freetuple(tup);
 
-	/*
-	 * No CommandCounterIncrement here: this is now called once per transaction
-	 * at PRE_COMMIT (appender_flush_eof), so there is no "next insert in this
-	 * transaction" that needs to see the row.  The commit record makes it
-	 * durable.
-	 */
 	table_close(meta, RowExclusiveLock);
 }
 
-/*
- * Reset the relation's EOF: delete its appender_meta row so the next read sees
- * EOF 0.  Called when the relation gets a new relfilenode (TRUNCATE, VACUUM
- * FULL, ALTER TABLE SET TABLESPACE): the old row's EOF refers to the old
- * relfilenode's data file, which no longer exists.
- */
+/* Delete every segment row of a storage (transactional). */
 void
-appender_reset_eof(Oid relid)
+appender_meta_delete(const RelFileLocator *rlocator)
 {
-	Oid			meta_relid = appender_meta_oid();
+	Oid			metaid = appender_meta_relid(true);
 	Relation	meta;
-	Snapshot	scan_snap;
+	TupleDesc	desc;
+	Snapshot	snap;
 	TableScanDesc scan;
-	TupleTableSlot *slot;
-	ItemPointerData tid;
-	bool		found = false;
+	HeapTuple	tup;
+	List	   *tids = NIL;
+	ListCell   *lc;
 
-	if (!OidIsValid(meta_relid))
-		elog(ERROR, "appender_meta is missing; re-create the extension");
+	if (!OidIsValid(metaid) ||
+		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(metaid)))
+		return;
 
-	meta = table_open(meta_relid, RowExclusiveLock);
+	meta = table_open(metaid, RowExclusiveLock);
+	desc = RelationGetDescr(meta);
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	scan = table_beginscan(meta, snap, 0, NULL);
 
-	scan_snap = RegisterSnapshot(GetLatestSnapshot());
-	scan = table_beginscan(meta, scan_snap, 0, NULL);
-	slot = table_slot_create(meta, NULL);
-	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
-		bool		isnull;
-		Oid			rowrelid = DatumGetObjectId(slot_getattr(slot, 1, &isnull));
+		AppenderSegment row;
 
-		if (rowrelid == relid)
+		if (appender_meta_row(tup, desc, rlocator, &row))
 		{
-			tid = slot->tts_tid;
-			found = true;
-			break;
+			ItemPointer tid = palloc(sizeof(ItemPointerData));
+
+			*tid = tup->t_self;
+			tids = lappend(tids, tid);
 		}
 	}
-	ExecDropSingleTupleTableSlot(slot);
 	table_endscan(scan);
-	UnregisterSnapshot(scan_snap);
+	UnregisterSnapshot(snap);
 
-	if (found)
-		simple_heap_delete(meta, &tid);
+	foreach(lc, tids)
+		simple_heap_delete(meta, (ItemPointer) lfirst(lc));
+	list_free_deep(tids);
 
 	table_close(meta, RowExclusiveLock);
 }

@@ -22,36 +22,36 @@ Appender tables avoid this by design:
 
 ## How it works
 
-Appender tables are stored in append-only data files
-(`<relfilenode>.dat.<filenum>`) that bypass the shared buffer manager. A data
-file is a sequence of blocks: a 16-byte header followed by a batch of tuples,
-packed back-to-back. A row is addressed by its block offset and its position
-within the block, which is its TID.
+Rows are stored as compact tuples (no per-row transaction header) packed into
+variable-size blocks, and blocks are appended to segment files
+(`<relfilenode>.dat.<segno>`) that bypass the shared buffer manager. A segment
+is sealed once it reaches `immotus_appender.segment_size` and is immutable from
+then on. Every block carries a checksum. A row's TID is logical:
+(segment, row number), independent of where the row is stored.
 
-A logical EOF per data file is kept in the `appender_meta` table (in the
-extension's schema) and updated once per transaction at commit; direct DML on
-it is blocked by a trigger. Row data is
-not WAL-logged; durability comes
-from fsync'ing dirty data files at commit together with the EOF update, so
-WAL volume is ~0 bytes per row.
+The `appender_meta` table (in the extension's schema) is the manifest: one row
+per segment with its committed end. A transaction's appends become visible
+when its manifest update commits, so appends are atomic and MVCC-correct.
+Concurrent writers append to different segments. Direct DML on the manifest is
+blocked by a trigger.
+
+Every block is WAL-logged by a custom resource manager, and touched segments
+are fsynced at commit before the manifest update.
 
 ## Status
 
-Version 0.1. `INSERT`, `COPY` and `SELECT` (sequential scan) work, with
-crash-safe durability. `UPDATE` and `DELETE` are not supported. Indexes,
-TOAST and `ANALYZE` are not implemented yet.
+Version 0.1 (in development). Supported: `INSERT`, `COPY`, sequential and
+parallel scans, savepoints, `TRUNCATE`, `ALTER TABLE` (including rewrites and
+`SET ACCESS METHOD`), `ANALYZE`, partitioning.
+
+Not supported: `UPDATE`, `DELETE`, `INSERT ... ON CONFLICT`, indexes, backward
+scans, `TABLESAMPLE`, unlogged and temporary tables, two-phase commit,
+`CLUSTER`/`VACUUM FULL`, moving a table to another tablespace.
+`CREATE DATABASE` from a template that contains appender tables requires
+`STRATEGY = FILE_COPY`. `pg_upgrade` does not carry segment files over; use a
+logical dump or logical replication to upgrade.
 
 Do not use in production.
-
-## Performance
-
-Measured with 1M rows, 4 columns, 64-byte payload, PostgreSQL 18:
-
-| metric | heap | appender | change |
-| --- | --- | --- | --- |
-| rows/s | 552,618 | 1,797,611 | +225% |
-| WAL bytes/row | 136.4 | 0.0 | -100% |
-| bytes/row (size) | 117.03 | 96.05 | -17.9% |
 
 ## Quick start
 
@@ -62,7 +62,8 @@ make install PG_CONFIG=/path/to/pg_config
 ```
 
 `immotus_appender` uses a custom WAL resource manager, so it must be loaded
-at server startup. Add this to `postgresql.conf` and restart:
+at server startup, on the primary and on every standby. Add this to
+`postgresql.conf` and restart:
 
 ```
 shared_preload_libraries = 'immotus_appender'

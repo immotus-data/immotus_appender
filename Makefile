@@ -7,9 +7,12 @@ MODULE_big = immotus_appender
 
 OBJS = \
         src/appender.o \
-        src/appender_memtuple.o \
         src/appender_datafile.o \
-        src/appender_metadata.o
+        src/appender_lifecycle.o \
+        src/appender_memtuple.o \
+        src/appender_metadata.o \
+        src/appender_writer.o \
+        src/appender_xlog.o
 PGFILEDESC = "immotus_appender — append-only table access method for PostgreSQL"
 
 EXTENSION = immotus_appender
