@@ -107,7 +107,8 @@ typedef struct AppenderScanDescData
 	bool		loaded;
 	uint32		row;			/* next row of the loaded block */
 	uint32		rowoff;
-	MemTupleBinding *bind;		/* layout of bind_natts attributes of bind_desc */
+	MemTupleBinding *bind;		/* layout of bind_natts attributes of
+								 * bind_desc */
 	TupleDesc	bind_desc;
 	int			bind_natts;
 	int64		an_hi;			/* ANALYZE: end of the sampled range */
@@ -546,7 +547,7 @@ static struct
 	int64		blockoff;
 	uint32		first;
 	bool		valid;
-} appender_fetch_cache;
+}			appender_fetch_cache;
 
 /* Find which visible byte range holds rownum of segno; false if none. */
 static bool

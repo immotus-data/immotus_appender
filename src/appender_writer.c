@@ -535,7 +535,7 @@ appender_writer_discard(const RelFileLocator *rlocator)
  */
 int
 appender_own_segments(const RelFileLocator *rlocator, CommandId curcid,
-					   AppenderScanSeg **segs)
+					  AppenderScanSeg **segs)
 {
 	AppenderWriter *w = appender_get_writer(rlocator, false);
 	AppenderScanSeg *out;
@@ -850,7 +850,7 @@ appender_binding(Relation rel, int natts)
 		PG_TRY();
 		{
 			entry->bind = create_memtuple_binding(
-				CreateTupleDescTruncatedCopy(RelationGetDescr(rel), natts));
+												  CreateTupleDescTruncatedCopy(RelationGetDescr(rel), natts));
 		}
 		PG_FINALLY();
 		{
