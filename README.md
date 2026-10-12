@@ -4,21 +4,23 @@ Append-only table access method for PostgreSQL.
 
 `immotus_appender` is a PostgreSQL extension that provides the `appender`
 table access method. Tables created with `USING appender` are write-once:
-rows are only ever appended and never updated or deleted, so there are no
-dead tuples, no vacuum, and no bloat.
+rows are only ever appended and never updated or deleted.
 
 ## Why
 
-PostgreSQL's built-in heap storage implements MVCC by keeping old tuple
-versions and removing them with autovacuum. On write-heavy immutable
-workloads (audit logs, event streams, IoT telemetry) autovacuum can fall
-behind, leaving dead tuples that bloat tables and slow down scans.
+Append-only data (audit logs, event streams, telemetry) is stored more
+compactly and written with less WAL when the storage knows it will never
+change:
 
-Appender tables avoid this by design:
+- rows carry no per-row transaction header, so they are smaller;
+- blocks are written once and never modified, so WAL carries no full-page
+  images;
+- rows never need freezing, so large tables never trigger anti-wraparound
+  vacuums;
+- rows are immutable by construction, not by convention.
 
-- no `UPDATE` / `DELETE`, so no dead tuples are ever produced;
-- no vacuum, so no IO spikes and no tuning;
-- append-only data files, so inserts always write to the end of the file.
+Sealed segments are immutable files, which is the basis for moving cold data
+to cheaper storage in a later release.
 
 ## How it works
 
@@ -35,14 +37,17 @@ when its manifest update commits, so appends are atomic and MVCC-correct.
 Concurrent writers append to different segments. Direct DML on the manifest is
 blocked by a trigger.
 
-Every block is WAL-logged by a custom resource manager, and touched segments
-are fsynced at commit before the manifest update.
+Every change to segment files is WAL-logged by a custom resource manager, so
+streaming replication, point-in-time recovery, incremental backups and
+`pg_rewind` work. Touched segments are fsynced at commit, before the manifest
+update: a commit therefore costs one more fsync than on heap, which matters
+for single-row transactions and not for batched inserts.
 
 ## Status
 
 Version 0.1 (in development). Supported: `INSERT`, `COPY`, sequential and
 parallel scans, savepoints, `TRUNCATE`, `ALTER TABLE` (including rewrites and
-`SET ACCESS METHOD`), `ANALYZE`, partitioning.
+`SET ACCESS METHOD`), `ANALYZE`, partitioning, streaming replication, PITR.
 
 Not supported: `UPDATE`, `DELETE`, `INSERT ... ON CONFLICT`, indexes, backward
 scans, `TABLESAMPLE`, unlogged and temporary tables, two-phase commit,
@@ -51,7 +56,23 @@ scans, `TABLESAMPLE`, unlogged and temporary tables, two-phase commit,
 `STRATEGY = FILE_COPY`. `pg_upgrade` does not carry segment files over; use a
 logical dump or logical replication to upgrade.
 
+Segment files left behind by a crash between a `DROP` and its file removal
+can be removed with `SELECT appender_gc()`. `appender_relation_size(regclass)`
+reports the on-disk size of a table (`pg_relation_size` does not see segment
+files).
+
 Do not use in production.
+
+## Performance
+
+1M rows, 4 columns, 64-byte payload, one `INSERT ... SELECT`, PostgreSQL 18.6
+built without optimization; relative numbers only:
+
+| | rows/s | WAL bytes/row | bytes/row on disk |
+| --- | --- | --- | --- |
+| heap | 365,162 | 136.5 | 117.0 |
+| heap, `UNLOGGED` | 599,563 | 0 | 117.0 |
+| appender | 506,832 | 96.5 | 96.1 |
 
 ## Quick start
 
@@ -103,10 +124,16 @@ make install      PG_CONFIG=/path/to/pg_config   # install the extension
 make installcheck PG_CONFIG=/path/to/pg_config
 ```
 
-`make installcheck` runs the SQL regression test (`sql/appender.sql`) and the
-TAP test (`t/001_basic.pl`) against a running server. The TAP test is skipped
-unless PostgreSQL was built with `--enable-tap-tests`. Set `PGPORT` if the
-test cluster is not on the default port.
+`make installcheck` runs, against a running server:
+
+- the SQL regression test (`sql/appender.sql`);
+- the isolation test of concurrent writers and readers (`specs/`);
+- the TAP tests (`t/`): crash recovery, streaming replication and promotion,
+  point-in-time recovery, incremental backup and `pg_rewind`.
+
+The server must load the library (`shared_preload_libraries`). The TAP tests
+are skipped unless PostgreSQL was built with `--enable-tap-tests`. Set
+`PGPORT` if the test cluster is not on the default port.
 
 ## License
 
