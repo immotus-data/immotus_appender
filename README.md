@@ -74,14 +74,15 @@ payload.
 | bulk load, rows/s (`INSERT ... SELECT` 1M rows) | 707,884 | **1,019,649** |
 | WAL, bytes/row | 136.4 | **96.6** |
 | size on disk, bytes/row | 117.0 | **96.1** |
-| full scan of 1M rows, single process, ms | **37.6** | 58.0 |
-| full scan of 1M rows, 2 workers, speedup over single process | **2.4x** | 2.6x |
+| `count(*)` over 1M rows, single process, ms | **34.8** | 38.4 |
+| `count(*)` over 1M rows, 2 workers, ms | **15.5** | 16.4 |
 | 1 row per commit, 4 clients, commits/s | **60,053** | 31,250 |
 | 100 rows per commit, 4 clients, rows/s | **432,900** | 234,000 |
 
-Bulk loads are faster and smaller. Scans are slower for now: every row is
-fully deformed and every block's checksum is verified. Short transactions pay
-for the extra fsync at commit.
+Bulk loads are faster and smaller. Scans are close to heap: rows are deformed
+only up to the columns a query needs, and block checksums are computed in
+three interleaved streams; what remains is copying from the OS page cache.
+Short transactions pay for the extra fsync at commit.
 
 ## Quick start
 

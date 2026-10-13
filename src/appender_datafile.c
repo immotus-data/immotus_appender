@@ -21,6 +21,109 @@
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
+/*
+ * The crc32c instruction has a latency of several cycles but a throughput of
+ * one per cycle, so three independent streams over adjacent stripes run about
+ * three times faster than one.  The stripe CRCs are merged by advancing them
+ * over the following stripes, a linear map on 32 bits applied by table.
+ */
+#if !defined(WORDS_BIGENDIAN) && defined(USE_ARMV8_CRC32C)
+#include <arm_acle.h>
+#define APPENDER_CRC32C_U64(crc, v) __crc32cd((crc), (v))
+#elif !defined(WORDS_BIGENDIAN) && defined(USE_SSE42_CRC32C)
+#include <nmmintrin.h>
+#define APPENDER_CRC32C_U64(crc, v) ((uint32) _mm_crc32_u64((crc), (v)))
+#endif
+
+#ifdef APPENDER_CRC32C_U64
+
+#define APPENDER_CRC_STRIPE 1024
+
+/* [0]: advance over one stripe, [1]: over two; per byte of the CRC */
+static uint32 appender_crc_shift[2][4][256];
+static bool appender_crc_shift_ready = false;
+
+static void
+appender_crc_shift_init(void)
+{
+	static const char zeros[2 * APPENDER_CRC_STRIPE];
+
+	for (int s = 0; s < 2; s++)
+	{
+		uint32		basis[32];
+
+		for (int k = 0; k < 32; k++)
+		{
+			basis[k] = (uint32) 1 << k;
+			COMP_CRC32C(basis[k], zeros, (s + 1) * APPENDER_CRC_STRIPE);
+		}
+		for (int j = 0; j < 4; j++)
+			for (int b = 0; b < 256; b++)
+			{
+				uint32		v = 0;
+
+				for (int k = 0; k < 8; k++)
+					if (b & (1 << k))
+						v ^= basis[8 * j + k];
+				appender_crc_shift[s][j][b] = v;
+			}
+	}
+	appender_crc_shift_ready = true;
+}
+
+static inline uint32
+appender_crc_advance(int s, uint32 crc)
+{
+	return appender_crc_shift[s][0][crc & 0xFF] ^
+		appender_crc_shift[s][1][(crc >> 8) & 0xFF] ^
+		appender_crc_shift[s][2][(crc >> 16) & 0xFF] ^
+		appender_crc_shift[s][3][crc >> 24];
+}
+#endif
+
+static pg_crc32c
+appender_crc32c(pg_crc32c crc, const char *p, size_t len)
+{
+#ifdef APPENDER_CRC32C_U64
+#ifdef USE_ASSERT_CHECKING
+	pg_crc32c	expected = crc;
+
+	COMP_CRC32C(expected, p, len);
+#endif
+	if (len >= 3 * APPENDER_CRC_STRIPE && !appender_crc_shift_ready)
+		appender_crc_shift_init();
+
+	while (len >= 3 * APPENDER_CRC_STRIPE)
+	{
+		uint32		a = crc;
+		uint32		b = 0;
+		uint32		c = 0;
+
+		for (int i = 0; i < APPENDER_CRC_STRIPE; i += 8)
+		{
+			uint64		va;
+			uint64		vb;
+			uint64		vc;
+
+			memcpy(&va, p + i, 8);
+			memcpy(&vb, p + APPENDER_CRC_STRIPE + i, 8);
+			memcpy(&vc, p + 2 * APPENDER_CRC_STRIPE + i, 8);
+			a = APPENDER_CRC32C_U64(a, va);
+			b = APPENDER_CRC32C_U64(b, vb);
+			c = APPENDER_CRC32C_U64(c, vc);
+		}
+		crc = appender_crc_advance(1, a) ^ appender_crc_advance(0, b) ^ c;
+		p += 3 * APPENDER_CRC_STRIPE;
+		len -= 3 * APPENDER_CRC_STRIPE;
+	}
+	COMP_CRC32C(crc, p, len);
+	Assert(crc == expected);
+#else
+	COMP_CRC32C(crc, p, len);
+#endif
+	return crc;
+}
+
 static pg_crc32c
 appender_block_crc(const AppenderBlockHeader *hdr, const char *payload)
 {
@@ -30,7 +133,7 @@ appender_block_crc(const AppenderBlockHeader *hdr, const char *payload)
 	COMP_CRC32C(crc, (const char *) hdr + sizeof(pg_crc32c),
 				sizeof(AppenderBlockHeader) - sizeof(pg_crc32c));
 	if (hdr->datalen > 0)
-		COMP_CRC32C(crc, payload, hdr->datalen);
+		crc = appender_crc32c(crc, payload, hdr->datalen);
 	FIN_CRC32C(crc);
 	return crc;
 }
