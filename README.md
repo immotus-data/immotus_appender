@@ -65,14 +65,22 @@ Do not use in production.
 
 ## Performance
 
-1M rows, 4 columns, 64-byte payload, one `INSERT ... SELECT`, PostgreSQL 18.6
-built without optimization; relative numbers only:
+PostgreSQL 18.6 release build (`-O3`, no assertions), `shared_buffers = 1GB`,
+Apple M-series laptop, medians of 3 runs. Rows of 4 columns with a 64-byte
+payload.
 
-| | rows/s | WAL bytes/row | bytes/row on disk |
-| --- | --- | --- | --- |
-| heap | 365,162 | 136.5 | 117.0 |
-| heap, `UNLOGGED` | 599,563 | 0 | 117.0 |
-| appender | 506,832 | 96.5 | 96.1 |
+| | heap | appender |
+| --- | --- | --- |
+| bulk load, rows/s (`INSERT ... SELECT` 1M rows) | 707,884 | **1,019,649** |
+| WAL, bytes/row | 136.4 | **96.6** |
+| size on disk, bytes/row | 117.0 | **96.1** |
+| full scan of 1M rows, single process, ms | **37.6** | 58.0 |
+| 1 row per commit, 4 clients, commits/s | **60,053** | 31,250 |
+| 100 rows per commit, 4 clients, rows/s | **432,900** | 234,000 |
+
+Bulk loads are faster and smaller. Scans are slower for now: every row is
+fully deformed and every block's checksum is verified. Short transactions pay
+for the extra fsync at commit.
 
 ## Quick start
 
