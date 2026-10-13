@@ -145,6 +145,16 @@ BEGIN;
 INSERT INTO sg VALUES (1000000, 'own');
 SELECT count(*), sum(a) FROM sg;
 ROLLBACK;
+-- a single segment is shared block by block, each row read exactly once
+CREATE TABLE one (a int) USING appender;
+INSERT INTO one SELECT generate_series(1, 50000);
+EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT ctid), sum(a) FROM one;
+SELECT count(*), count(DISTINCT ctid), sum(a) FROM one;
+BEGIN;
+INSERT INTO one SELECT generate_series(50001, 60000);
+SELECT count(*), count(DISTINCT ctid), sum(a) FROM one;
+ROLLBACK;
+DROP TABLE one;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;

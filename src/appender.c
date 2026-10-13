@@ -82,10 +82,17 @@ appender_slot_copy_heap_tuple(TupleTableSlot *slot)
 typedef struct AppenderParallelScanData
 {
 	ParallelTableScanDescData base;
-	pg_atomic_uint32 next;		/* next segment index to hand out */
+	pg_atomic_uint64 cursor;	/* next unclaimed block, see APPENDER_CURSOR */
 	int32		nown;			/* leader's own appends */
 	AppenderScanSeg own[FLEXIBLE_ARRAY_MEMBER];
 } AppenderParallelScanData;
+
+/* Block position shared by parallel workers: segment index, range, offset. */
+#define APPENDER_CURSOR(seg, range, off) \
+	(((uint64) (seg) << 48) | ((uint64) (range) << 47) | (uint64) (off))
+#define APPENDER_CURSOR_SEG(c)		((int) ((c) >> 48))
+#define APPENDER_CURSOR_RANGE(c)	((int) (((c) >> 47) & 1))
+#define APPENDER_CURSOR_OFF(c)		((int64) ((c) & ((UINT64CONST(1) << 47) - 1)))
 
 typedef struct AppenderScanDescData
 {
@@ -204,15 +211,7 @@ appender_scan_next_range(AppenderScanDesc scan)
 			}
 		}
 
-		if (scan->rs_base.rs_parallel)
-		{
-			AppenderParallelScanData *p = (AppenderParallelScanData *) scan->rs_base.rs_parallel;
-
-			scan->cur = (int) pg_atomic_fetch_add_u32(&p->next, 1);
-		}
-		else
-			scan->cur++;
-
+		scan->cur++;
 		if (scan->cur >= scan->nsegs)
 		{
 			scan->cur = scan->nsegs;
@@ -230,6 +229,32 @@ appender_scan_next_range(AppenderScanDesc scan)
 	}
 }
 
+static void
+appender_scan_read_payload(AppenderScanDesc scan, File file, int64 off)
+{
+	if (scan->hdr.datalen > scan->blockcap)
+	{
+		if (scan->block)
+			pfree(scan->block);
+		scan->block = MemoryContextAlloc(scan->mcxt, scan->hdr.datalen);
+		scan->blockcap = scan->hdr.datalen;
+	}
+	appender_seg_read_payload(file, off, &scan->hdr, scan->block);
+	scan->loaded = true;
+	scan->row = 0;
+	scan->rowoff = 0;
+}
+
+static void
+appender_check_block(AppenderScanDesc scan, File file, int64 off, int64 end)
+{
+	if (off + appender_block_size(&scan->hdr) > end)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block at offset %lld of file \"%s\" extends past the segment end",
+						(long long) off, FilePathName(file))));
+}
+
 /* Read the block at scan->off (header only unless payload) and step past it. */
 static void
 appender_scan_load(AppenderScanDesc scan, bool payload)
@@ -238,27 +263,91 @@ appender_scan_load(AppenderScanDesc scan, bool payload)
 	File		file = appender_scan_file(scan, s->segno);
 
 	appender_seg_read_header(file, scan->off, &scan->hdr);
-	if (scan->off + appender_block_size(&scan->hdr) > scan->range_end)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("block at offset %lld of file \"%s\" extends past the segment end",
-						(long long) scan->off, FilePathName(file))));
-
+	appender_check_block(scan, file, scan->off, scan->range_end);
 	if (payload)
-	{
-		if (scan->hdr.datalen > scan->blockcap)
-		{
-			if (scan->block)
-				pfree(scan->block);
-			scan->block = MemoryContextAlloc(scan->mcxt, scan->hdr.datalen);
-			scan->blockcap = scan->hdr.datalen;
-		}
-		appender_seg_read_payload(file, scan->off, &scan->hdr, scan->block);
-		scan->loaded = true;
-		scan->row = 0;
-		scan->rowoff = 0;
-	}
+		appender_scan_read_payload(scan, file, scan->off);
 	scan->off += appender_block_size(&scan->hdr);
+}
+
+/* Byte range of (seg, range); false if it is empty. */
+static bool
+appender_range_bounds(AppenderScanDesc scan, int seg, int range,
+					  int64 *lo, int64 *hi)
+{
+	AppenderScanSeg *s;
+
+	if (seg >= scan->nsegs)
+		return false;
+	s = &scan->segs[seg];
+	*lo = range == 0 ? APPENDER_SEG_DATA_START : s->own_off;
+	*hi = range == 0 ? s->eof : s->own_eof;
+	return *hi > *lo;
+}
+
+/*
+ * Claim the next block of a parallel scan.  Workers advance the shared
+ * cursor past a block with compare-and-swap once they have read its header;
+ * the payload is read and decoded outside of any coordination.
+ */
+static bool
+appender_parallel_claim(AppenderScanDesc scan)
+{
+	AppenderParallelScanData *p = (AppenderParallelScanData *) scan->rs_base.rs_parallel;
+	uint64		cur = pg_atomic_read_u64(&p->cursor);
+
+	for (;;)
+	{
+		int			seg = APPENDER_CURSOR_SEG(cur);
+		int			range = APPENDER_CURSOR_RANGE(cur);
+		int64		off = APPENDER_CURSOR_OFF(cur);
+		int64		lo;
+		int64		hi;
+		File		file;
+
+		if (!appender_range_bounds(scan, seg, range, &lo, &hi) || off >= hi)
+		{
+			/* step to the start of the next non-empty range */
+			do
+			{
+				if (seg >= scan->nsegs)
+					return false;
+				if (range == 0)
+					range = 1;
+				else
+				{
+					seg++;
+					range = 0;
+				}
+			} while (!appender_range_bounds(scan, seg, range, &lo, &hi));
+
+			pg_atomic_compare_exchange_u64(&p->cursor, &cur,
+										   APPENDER_CURSOR(seg, range, lo));
+			cur = pg_atomic_read_u64(&p->cursor);
+			continue;
+		}
+
+		if (off < lo)
+		{
+			pg_atomic_compare_exchange_u64(&p->cursor, &cur,
+										   APPENDER_CURSOR(seg, range, lo));
+			cur = pg_atomic_read_u64(&p->cursor);
+			continue;
+		}
+
+		file = appender_scan_file(scan, scan->segs[seg].segno);
+		appender_seg_read_header(file, off, &scan->hdr);
+		appender_check_block(scan, file, off, hi);
+
+		if (pg_atomic_compare_exchange_u64(&p->cursor, &cur,
+										   APPENDER_CURSOR(seg, range,
+														   off + appender_block_size(&scan->hdr))))
+		{
+			scan->cur = seg;
+			appender_scan_read_payload(scan, file, off);
+			return true;
+		}
+		/* another participant took it; cur now holds the new position */
+	}
 }
 
 static MemTuple
@@ -412,7 +501,15 @@ appender_getnextslot(TableScanDesc sscan, ScanDirection direction,
 		}
 		scan->loaded = false;
 
-		if (scan->off < scan->range_end)
+		if (scan->rs_base.rs_parallel)
+		{
+			if (!appender_parallel_claim(scan))
+			{
+				ExecClearTuple(slot);
+				return false;
+			}
+		}
+		else if (scan->off < scan->range_end)
 			appender_scan_load(scan, true);
 		else if (!appender_scan_next_range(scan))
 		{
@@ -489,7 +586,7 @@ appender_scan_analyze_next_tuple(TableScanDesc sscan, TransactionId OldestXmin,
 }
 
 /* ----------------------------------------------------------------------------
- * Parallel scans hand out whole segments.
+ * Parallel scans hand out blocks through a shared cursor.
  * ------------------------------------------------------------------------- */
 
 static Size
@@ -521,7 +618,7 @@ appender_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 
 	p->base.phs_locator = rel->rd_locator;
 	p->base.phs_syncscan = false;
-	pg_atomic_init_u32(&p->next, 0);
+	pg_atomic_init_u64(&p->cursor, 0);
 	p->nown = nown;
 	if (nown > 0)
 		memcpy(p->own, own, nown * sizeof(AppenderScanSeg));
@@ -531,7 +628,7 @@ appender_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 static void
 appender_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 {
-	pg_atomic_write_u32(&((AppenderParallelScanData *) pscan)->next, 0);
+	pg_atomic_write_u64(&((AppenderParallelScanData *) pscan)->cursor, 0);
 }
 
 /* ----------------------------------------------------------------------------

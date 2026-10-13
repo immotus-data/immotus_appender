@@ -269,6 +269,36 @@ SELECT count(*), sum(a) FROM sg;
 (1 row)
 
 ROLLBACK;
+-- a single segment is shared block by block, each row read exactly once
+CREATE TABLE one (a int) USING appender;
+INSERT INTO one SELECT generate_series(1, 50000);
+EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT ctid), sum(a) FROM one;
+                 QUERY PLAN                 
+--------------------------------------------
+ Aggregate
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Sort
+               Sort Key: ctid
+               ->  Parallel Seq Scan on one
+(6 rows)
+
+SELECT count(*), count(DISTINCT ctid), sum(a) FROM one;
+ count | count |    sum     
+-------+-------+------------
+ 50000 | 50000 | 1250025000
+(1 row)
+
+BEGIN;
+INSERT INTO one SELECT generate_series(50001, 60000);
+SELECT count(*), count(DISTINCT ctid), sum(a) FROM one;
+ count | count |    sum     
+-------+-------+------------
+ 60000 | 60000 | 1800030000
+(1 row)
+
+ROLLBACK;
+DROP TABLE one;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;

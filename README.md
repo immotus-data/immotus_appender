@@ -75,6 +75,7 @@ payload.
 | WAL, bytes/row | 136.4 | **96.6** |
 | size on disk, bytes/row | 117.0 | **96.1** |
 | full scan of 1M rows, single process, ms | **37.6** | 58.0 |
+| full scan of 1M rows, 2 workers, speedup over single process | **2.4x** | 2.6x |
 | 1 row per commit, 4 clients, commits/s | **60,053** | 31,250 |
 | 100 rows per commit, 4 clients, rows/s | **432,900** | 234,000 |
 
