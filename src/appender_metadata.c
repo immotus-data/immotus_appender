@@ -3,22 +3,24 @@
  * appender_metadata.c
  *    Segment manifest of appender tables.
  *
- * The manifest is maintained with simple_heap_insert/update/delete, which
- * bypass triggers and index maintenance; the table therefore has no indexes
- * and is read with a sequential scan.
+ * The manifest is maintained with the CatalogTuple* routines, which bypass
+ * triggers but keep its unique index (spcoid, relfilenode, segno) up to date.
+ * Every lookup is an index scan, so its cost does not grow with the number
+ * of appender tables.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
+#include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/stratnum.h"
 #include "access/table.h"
-#include "access/tableam.h"
 #include "appender_datafile.h"
 #include "appender_metadata.h"
+#include "catalog/indexing.h"
 #include "commands/extension.h"
-#include "common/int.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -34,20 +36,30 @@
 #define Anum_appender_meta_version		7
 
 static Oid	appender_meta_oid = InvalidOid;
+static Oid	appender_meta_index_oid = InvalidOid;
+
+static void
+appender_meta_lookup(void)
+{
+	Oid			extoid = get_extension_oid("immotus_appender", true);
+
+	if (OidIsValid(extoid))
+	{
+		Oid			nsp = get_extension_schema(extoid);
+
+		appender_meta_oid = get_relname_relid("appender_meta", nsp);
+		appender_meta_index_oid = get_relname_relid("appender_meta_key", nsp);
+	}
+}
 
 Oid
 appender_meta_relid(bool missing_ok)
 {
-	if (!OidIsValid(appender_meta_oid))
-	{
-		Oid			extoid = get_extension_oid("immotus_appender", true);
+	if (!OidIsValid(appender_meta_oid) || !OidIsValid(appender_meta_index_oid))
+		appender_meta_lookup();
 
-		if (OidIsValid(extoid))
-			appender_meta_oid = get_relname_relid("appender_meta",
-												  get_extension_schema(extoid));
-	}
-
-	if (!OidIsValid(appender_meta_oid) && !missing_ok)
+	if ((!OidIsValid(appender_meta_oid) || !OidIsValid(appender_meta_index_oid)) &&
+		!missing_ok)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("appender_meta is missing"),
@@ -59,35 +71,47 @@ appender_meta_relid(bool missing_ok)
 void
 appender_meta_invalidate(Oid relid)
 {
-	if (!OidIsValid(relid) || relid == appender_meta_oid)
+	if (!OidIsValid(relid) || relid == appender_meta_oid ||
+		relid == appender_meta_index_oid)
+	{
 		appender_meta_oid = InvalidOid;
+		appender_meta_index_oid = InvalidOid;
+	}
 }
 
-static bool
-appender_meta_row(HeapTuple tup, TupleDesc desc, const RelFileLocator *rlocator,
-				  AppenderSegment *seg)
+static void
+appender_meta_row(HeapTuple tup, TupleDesc desc, AppenderSegment *seg)
 {
 	Datum		values[Natts_appender_meta];
 	bool		nulls[Natts_appender_meta];
 
 	heap_deform_tuple(tup, desc, values, nulls);
-
-	if (DatumGetObjectId(values[Anum_appender_meta_spcoid - 1]) != rlocator->spcOid ||
-		DatumGetObjectId(values[Anum_appender_meta_relfilenode - 1]) != rlocator->relNumber)
-		return false;
-
 	seg->segno = DatumGetInt32(values[Anum_appender_meta_segno - 1]);
 	seg->state = DatumGetInt16(values[Anum_appender_meta_state - 1]);
 	seg->eof = DatumGetInt64(values[Anum_appender_meta_eof - 1]);
 	seg->rowcount = DatumGetInt64(values[Anum_appender_meta_rowcount - 1]);
-	return true;
 }
 
-static int
-appender_segment_cmp(const void *a, const void *b)
+/* Index scan over a storage's rows, or one segment's row if segno > 0. */
+static SysScanDesc
+appender_meta_beginscan(Relation meta, const RelFileLocator *rlocator,
+						int segno, Snapshot snapshot, ScanKeyData *keys)
 {
-	return pg_cmp_s32(((const AppenderSegment *) a)->segno,
-					  ((const AppenderSegment *) b)->segno);
+	int			nkeys = 2;
+
+	ScanKeyInit(&keys[0], Anum_appender_meta_spcoid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(rlocator->spcOid));
+	ScanKeyInit(&keys[1], Anum_appender_meta_relfilenode, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(rlocator->relNumber));
+	if (segno > 0)
+	{
+		ScanKeyInit(&keys[2], Anum_appender_meta_segno, BTEqualStrategyNumber,
+					F_INT4EQ, Int32GetDatum(segno));
+		nkeys = 3;
+	}
+
+	return systable_beginscan(meta, appender_meta_index_oid, true, snapshot,
+							  nkeys, keys);
 }
 
 /*
@@ -99,31 +123,27 @@ appender_meta_segments(const RelFileLocator *rlocator, Snapshot snapshot,
 					   AppenderSegment **segs)
 {
 	Relation	meta = table_open(appender_meta_relid(false), AccessShareLock);
-	TupleDesc	desc = RelationGetDescr(meta);
 	Snapshot	snap = RegisterSnapshot(snapshot);
-	TableScanDesc scan = table_beginscan(meta, snap, 0, NULL);
+	ScanKeyData keys[3];
+	SysScanDesc scan = appender_meta_beginscan(meta, rlocator, 0, snap, keys);
 	HeapTuple	tup;
 	int			n = 0;
 	int			cap = 8;
 	AppenderSegment *out = palloc(cap * sizeof(AppenderSegment));
 
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		if (n == cap)
 		{
 			cap *= 2;
 			out = repalloc(out, cap * sizeof(AppenderSegment));
 		}
-		if (appender_meta_row(tup, desc, rlocator, &out[n]))
-			n++;
+		appender_meta_row(tup, RelationGetDescr(meta), &out[n++]);
 	}
 
-	table_endscan(scan);
+	systable_endscan(scan);
 	UnregisterSnapshot(snap);
 	table_close(meta, AccessShareLock);
-
-	if (n > 1)
-		qsort(out, n, sizeof(AppenderSegment), appender_segment_cmp);
 
 	*segs = out;
 	return n;
@@ -133,20 +153,19 @@ bool
 appender_meta_get(const RelFileLocator *rlocator, int segno, Snapshot snapshot,
 				  AppenderSegment *seg)
 {
-	AppenderSegment *segs;
-	int			n = appender_meta_segments(rlocator, snapshot, &segs);
-	bool		found = false;
+	Relation	meta = table_open(appender_meta_relid(false), AccessShareLock);
+	Snapshot	snap = RegisterSnapshot(snapshot);
+	ScanKeyData keys[3];
+	SysScanDesc scan = appender_meta_beginscan(meta, rlocator, segno, snap, keys);
+	HeapTuple	tup = systable_getnext(scan);
+	bool		found = HeapTupleIsValid(tup);
 
-	for (int i = 0; i < n; i++)
-	{
-		if (segs[i].segno == segno)
-		{
-			*seg = segs[i];
-			found = true;
-			break;
-		}
-	}
-	pfree(segs);
+	if (found)
+		appender_meta_row(tup, RelationGetDescr(meta), seg);
+
+	systable_endscan(scan);
+	UnregisterSnapshot(snap);
+	table_close(meta, AccessShareLock);
 	return found;
 }
 
@@ -158,27 +177,20 @@ void
 appender_meta_store(const RelFileLocator *rlocator, const AppenderSegment *seg)
 {
 	Relation	meta = table_open(appender_meta_relid(false), RowExclusiveLock);
-	TupleDesc	desc = RelationGetDescr(meta);
 	Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
-	TableScanDesc scan = table_beginscan(meta, snap, 0, NULL);
-	HeapTuple	tup;
+	ScanKeyData keys[3];
+	SysScanDesc scan = appender_meta_beginscan(meta, rlocator, seg->segno,
+											   snap, keys);
+	HeapTuple	old = systable_getnext(scan);
 	ItemPointerData oldtid;
-	bool		found = false;
+	bool		found = HeapTupleIsValid(old);
 	Datum		values[Natts_appender_meta];
 	bool		nulls[Natts_appender_meta] = {0};
+	HeapTuple	tup;
 
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		AppenderSegment row;
-
-		if (appender_meta_row(tup, desc, rlocator, &row) && row.segno == seg->segno)
-		{
-			oldtid = tup->t_self;
-			found = true;
-			break;
-		}
-	}
-	table_endscan(scan);
+	if (found)
+		oldtid = old->t_self;
+	systable_endscan(scan);
 	UnregisterSnapshot(snap);
 
 	values[Anum_appender_meta_spcoid - 1] = ObjectIdGetDatum(rlocator->spcOid);
@@ -189,15 +201,11 @@ appender_meta_store(const RelFileLocator *rlocator, const AppenderSegment *seg)
 	values[Anum_appender_meta_rowcount - 1] = Int64GetDatum(seg->rowcount);
 	values[Anum_appender_meta_version - 1] = Int16GetDatum(APPENDER_FORMAT_VERSION);
 
-	tup = heap_form_tuple(desc, values, nulls);
+	tup = heap_form_tuple(RelationGetDescr(meta), values, nulls);
 	if (found)
-	{
-		TU_UpdateIndexes update_indexes;
-
-		simple_heap_update(meta, &oldtid, tup, &update_indexes);
-	}
+		CatalogTupleUpdate(meta, &oldtid, tup);
 	else
-		simple_heap_insert(meta, tup);
+		CatalogTupleInsert(meta, tup);
 	heap_freetuple(tup);
 
 	table_close(meta, RowExclusiveLock);
@@ -209,39 +217,33 @@ appender_meta_delete(const RelFileLocator *rlocator)
 {
 	Oid			metaid = appender_meta_relid(true);
 	Relation	meta;
-	TupleDesc	desc;
 	Snapshot	snap;
-	TableScanDesc scan;
+	ScanKeyData keys[3];
+	SysScanDesc scan;
 	HeapTuple	tup;
 	List	   *tids = NIL;
 	ListCell   *lc;
 
 	if (!OidIsValid(metaid) ||
-		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(metaid)))
+		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(metaid)) ||
+		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(appender_meta_index_oid)))
 		return;
 
 	meta = table_open(metaid, RowExclusiveLock);
-	desc = RelationGetDescr(meta);
 	snap = RegisterSnapshot(GetLatestSnapshot());
-	scan = table_beginscan(meta, snap, 0, NULL);
-
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	scan = appender_meta_beginscan(meta, rlocator, 0, snap, keys);
+	while ((tup = systable_getnext(scan)) != NULL)
 	{
-		AppenderSegment row;
+		ItemPointer tid = palloc(sizeof(ItemPointerData));
 
-		if (appender_meta_row(tup, desc, rlocator, &row))
-		{
-			ItemPointer tid = palloc(sizeof(ItemPointerData));
-
-			*tid = tup->t_self;
-			tids = lappend(tids, tid);
-		}
+		*tid = tup->t_self;
+		tids = lappend(tids, tid);
 	}
-	table_endscan(scan);
+	systable_endscan(scan);
 	UnregisterSnapshot(snap);
 
 	foreach(lc, tids)
-		simple_heap_delete(meta, (ItemPointer) lfirst(lc));
+		CatalogTupleDelete(meta, (ItemPointer) lfirst(lc));
 	list_free_deep(tids);
 
 	table_close(meta, RowExclusiveLock);

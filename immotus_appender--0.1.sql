@@ -13,8 +13,7 @@ CREATE ACCESS METHOD appender TYPE TABLE HANDLER appender_tableam_handler;
  * Segment manifest: one row per segment of an appender relation storage.
  * A row's eof and rowcount become visible together with the commit of the
  * transaction that appended them, which is what makes appends atomic.
- * Maintained by the extension only; it has no index on purpose, because
- * the extension writes it with simple_heap_* calls that skip index upkeep.
+ * Maintained by the extension only.
  */
 CREATE TABLE appender_meta
 (
@@ -26,6 +25,8 @@ CREATE TABLE appender_meta
     rowcount        int8     NOT NULL,
     format_version  int2     NOT NULL
 );
+
+CREATE UNIQUE INDEX appender_meta_key ON appender_meta (spcoid, relfilenode, segno);
 
 CREATE FUNCTION appender_meta_guard()
 RETURNS trigger
