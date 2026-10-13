@@ -198,6 +198,33 @@ SELECT count(*), sum(a) FROM al;
      4 |  10
 (1 row)
 
+-- rows are deformed lazily, only up to the attributes a query needs
+CREATE TABLE lz (a int, b text, c int, d text) USING appender;
+INSERT INTO lz SELECT g, CASE WHEN g % 3 = 0 THEN NULL ELSE 'b' || g END,
+       CASE WHEN g % 5 = 0 THEN NULL ELSE g * 10 END, repeat('d', g % 7)
+  FROM generate_series(1, 1000) g;
+ALTER TABLE lz ADD COLUMN e int DEFAULT 42;
+SELECT count(*), sum(c), count(b), sum(length(d)), sum(e) FROM lz;
+ count |   sum   | count | sum  |  sum  
+-------+---------+-------+------+-------
+  1000 | 4000000 |   667 | 3003 | 42000
+(1 row)
+
+SELECT a, b, d FROM lz WHERE c IS NULL ORDER BY a LIMIT 3;
+ a  |  b  |   d   
+----+-----+-------
+  5 | b5  | ddddd
+ 10 | b10 | ddd
+ 15 |     | d
+(3 rows)
+
+SELECT count(*) FROM lz x JOIN lz y ON x.c = y.a * 10 WHERE y.b IS NOT NULL;
+ count 
+-------
+   533
+(1 row)
+
+DROP TABLE lz;
 -- statistics
 CREATE TABLE st (a int, b text) USING appender;
 INSERT INTO st SELECT g, md5(g::text) FROM generate_series(1, 20000) g;

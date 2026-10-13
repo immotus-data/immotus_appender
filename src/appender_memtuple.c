@@ -913,3 +913,33 @@ memtuple_deform(MemTuple mtup, MemTupleBinding *pbind, Datum *datum, bool *isnul
 {
 	memtuple_get_values(mtup, pbind, datum, isnull, true /* aligned */ );
 }
+
+/* Deform attributes [from, to) only; every attribute is directly addressable. */
+void
+memtuple_deform_range(MemTuple mtup, MemTupleBinding *pbind, int from, int to,
+					  Datum *datum, bool *isnull)
+{
+	bool		hasnull = memtuple_get_hasnull(mtup);
+	unsigned char *nullp = hasnull ? memtuple_get_nullp(mtup, pbind) : NULL;
+	char	   *start = (char *) mtup + (hasnull ? pbind->null_bitmap_extra_size : 0);
+	MemTupleBindingCols *colbind = memtuple_get_islarge(mtup) ? &pbind->large_bind : &pbind->bind;
+
+	Assert(from >= 0 && to <= pbind->tupdesc->natts);
+
+	for (int i = from; i < to; i++)
+	{
+		MemTupleAttrBinding *attrbind = &colbind->bindings[i];
+
+		if (hasnull && (nullp[attrbind->null_byte] & attrbind->null_mask))
+		{
+			isnull[i] = true;
+			datum[i] = (Datum) 0;
+			continue;
+		}
+		isnull[i] = false;
+		datum[i] = fetchatt(TupleDescAttr(pbind->tupdesc, i),
+							memtuple_get_attr_data_ptr(start, attrbind,
+													   colbind->null_saves_aligned,
+													   nullp));
+	}
+}

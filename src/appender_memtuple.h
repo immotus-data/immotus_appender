@@ -149,5 +149,7 @@ extern MemTuple memtuple_form_to(MemTupleBinding *pbind, Datum *values, bool *is
 								 uint32 len, uint32 null_save_len, bool hasnull,
 								 MemTuple mtup);
 extern void memtuple_deform(MemTuple mtup, MemTupleBinding *pbind, Datum *datum, bool *isnull);
+extern void memtuple_deform_range(MemTuple mtup, MemTupleBinding *pbind, int from, int to,
+								  Datum *datum, bool *isnull);
 
 #endif							/* APPENDER_MEMTUP_H */

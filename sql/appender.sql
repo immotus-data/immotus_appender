@@ -117,6 +117,17 @@ ALTER TABLE al SET ACCESS METHOD heap;
 ALTER TABLE al SET ACCESS METHOD appender;
 SELECT count(*), sum(a) FROM al;
 
+-- rows are deformed lazily, only up to the attributes a query needs
+CREATE TABLE lz (a int, b text, c int, d text) USING appender;
+INSERT INTO lz SELECT g, CASE WHEN g % 3 = 0 THEN NULL ELSE 'b' || g END,
+       CASE WHEN g % 5 = 0 THEN NULL ELSE g * 10 END, repeat('d', g % 7)
+  FROM generate_series(1, 1000) g;
+ALTER TABLE lz ADD COLUMN e int DEFAULT 42;
+SELECT count(*), sum(c), count(b), sum(length(d)), sum(e) FROM lz;
+SELECT a, b, d FROM lz WHERE c IS NULL ORDER BY a LIMIT 3;
+SELECT count(*) FROM lz x JOIN lz y ON x.c = y.a * 10 WHERE y.b IS NOT NULL;
+DROP TABLE lz;
+
 -- statistics
 CREATE TABLE st (a int, b text) USING appender;
 INSERT INTO st SELECT g, md5(g::text) FROM generate_series(1, 20000) g;

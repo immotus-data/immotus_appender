@@ -60,19 +60,94 @@ static object_access_hook_type prev_object_access_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
 /*
- * Virtual slots whose heap-tuple copies keep the TID: ANALYZE sorts its
- * sample by t_self.  Filled in from TTSOpsVirtual at load time.
+ * Virtual slots that deform a stored row lazily, on the first access to its
+ * attributes.  Heap-tuple copies keep the TID: ANALYZE sorts its sample by
+ * t_self.  Filled in from TTSOpsVirtual at load time.
  */
 static TupleTableSlotOps appender_slot_ops;
+
+typedef struct AppenderTupleTableSlot
+{
+	VirtualTupleTableSlot base;
+	MemTuple	mtup;			/* row not deformed yet, NULL if virtual */
+	MemTupleBinding *bind;
+	int			mtup_natts;		/* attributes stored in mtup */
+} AppenderTupleTableSlot;
+
+static void
+appender_slot_clear(TupleTableSlot *slot)
+{
+	((AppenderTupleTableSlot *) slot)->mtup = NULL;
+	TTSOpsVirtual.clear(slot);
+}
+
+/* Missing trailing attributes are filled in by slot_getsomeattrs_int(). */
+static void
+appender_slot_getsomeattrs(TupleTableSlot *slot, int natts)
+{
+	AppenderTupleTableSlot *aslot = (AppenderTupleTableSlot *) slot;
+	int			upto = Min(natts, aslot->mtup_natts);
+
+	Assert(aslot->mtup != NULL);
+	if (slot->tts_nvalid < upto)
+	{
+		memtuple_deform_range(aslot->mtup, aslot->bind, slot->tts_nvalid, upto,
+							  slot->tts_values, slot->tts_isnull);
+		slot->tts_nvalid = upto;
+	}
+}
+
+static void
+appender_slot_materialize(TupleTableSlot *slot)
+{
+	AppenderTupleTableSlot *aslot = (AppenderTupleTableSlot *) slot;
+
+	if (aslot->mtup)
+	{
+		slot_getallattrs(slot);
+		aslot->mtup = NULL;
+	}
+	TTSOpsVirtual.materialize(slot);
+}
+
+static void
+appender_slot_copyslot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
+{
+	((AppenderTupleTableSlot *) dstslot)->mtup = NULL;
+	TTSOpsVirtual.copyslot(dstslot, srcslot);
+}
 
 static HeapTuple
 appender_slot_copy_heap_tuple(TupleTableSlot *slot)
 {
-	HeapTuple	tup = TTSOpsVirtual.copy_heap_tuple(slot);
+	HeapTuple	tup;
 
+	slot_getallattrs(slot);
+	tup = TTSOpsVirtual.copy_heap_tuple(slot);
 	tup->t_self = slot->tts_tid;
 	tup->t_tableOid = slot->tts_tableOid;
 	return tup;
+}
+
+static MinimalTuple
+appender_slot_copy_minimal_tuple(TupleTableSlot *slot, Size extra)
+{
+	slot_getallattrs(slot);
+	return TTSOpsVirtual.copy_minimal_tuple(slot, extra);
+}
+
+/* Store a row to be deformed on demand; mtup and bind must outlive it. */
+static void
+appender_slot_store(TupleTableSlot *slot, MemTuple mtup, MemTupleBinding *bind,
+					int natts)
+{
+	AppenderTupleTableSlot *aslot = (AppenderTupleTableSlot *) slot;
+
+	ExecClearTuple(slot);
+	aslot->mtup = mtup;
+	aslot->bind = bind;
+	aslot->mtup_natts = natts;
+	slot->tts_flags &= ~TTS_FLAG_EMPTY;
 }
 
 /* ----------------------------------------------------------------------------
@@ -408,9 +483,14 @@ appender_scan_emit(AppenderScanDesc scan, TupleTableSlot *slot)
 		MemoryContextSwitchTo(oldctx);
 	}
 
-	ExecClearTuple(slot);
-	appender_deform(mtup, scan->bind, scan->hdr.natts, desc, slot);
-	ExecStoreVirtualTuple(slot);
+	if (slot->tts_ops == &appender_slot_ops)
+		appender_slot_store(slot, mtup, scan->bind, scan->hdr.natts);
+	else
+	{
+		ExecClearTuple(slot);
+		appender_deform(mtup, scan->bind, scan->hdr.natts, desc, slot);
+		ExecStoreVirtualTuple(slot);
+	}
 	appender_tid_set(&slot->tts_tid, scan->segs[scan->cur].segno,
 					 scan->hdr.first_rownum + scan->row);
 	slot->tts_tableOid = RelationGetRelid(rel);
@@ -1318,7 +1398,13 @@ _PG_init(void)
 	MarkGUCPrefixReserved("immotus_appender");
 
 	appender_slot_ops = TTSOpsVirtual;
+	appender_slot_ops.base_slot_size = sizeof(AppenderTupleTableSlot);
+	appender_slot_ops.clear = appender_slot_clear;
+	appender_slot_ops.getsomeattrs = appender_slot_getsomeattrs;
+	appender_slot_ops.materialize = appender_slot_materialize;
+	appender_slot_ops.copyslot = appender_slot_copyslot;
 	appender_slot_ops.copy_heap_tuple = appender_slot_copy_heap_tuple;
+	appender_slot_ops.copy_minimal_tuple = appender_slot_copy_minimal_tuple;
 
 	RegisterCustomRmgr(RM_APPENDER_ID, &appender_rmgr);
 	RegisterXactCallback(appender_xact_callback, NULL);
