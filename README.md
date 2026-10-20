@@ -57,13 +57,15 @@ Not supported: `UPDATE`, `DELETE`, `INSERT ... ON CONFLICT`, indexes, backward
 scans, `TABLESAMPLE`, unlogged and temporary tables, two-phase commit,
 `CLUSTER`/`VACUUM FULL`, moving a table to another tablespace.
 `CREATE DATABASE` from a template that contains appender tables requires
-`STRATEGY = FILE_COPY`. `pg_upgrade` does not carry segment files over; use a
-logical dump or logical replication to upgrade.
+`STRATEGY = FILE_COPY`. Major-version upgrades use `pg_upgrade` plus a copy of
+the segment files; see `doc/pg_upgrade.md`.
 
 Segment files left behind by a crash between a `DROP` and its file removal
 can be removed with `SELECT appender_gc()`. `appender_relation_size(regclass)`
-reports the on-disk size of a table (`pg_relation_size` does not see segment
-files).
+reports the on-disk size of a table: `pg_relation_size`, `pg_table_size` and
+`pg_total_relation_size` are smgr-based and report 0 for appender tables.
+Because segment files live under `base/<dboid>`, `pg_database_size()` and
+`pg_tablespace_size()` do count them.
 
 Do not use in production.
 
