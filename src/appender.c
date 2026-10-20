@@ -1395,6 +1395,13 @@ _PG_init(void)
 							1024, 1, 1024 * 1024,
 							PGC_USERSET, GUC_UNIT_MB,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("immotus_appender.prealloc_chunk",
+							"Chunk of a segment preallocated (zero-filled) at once.",
+							"Zero-filled ahead so commits inside the chunk only fdatasync; 0 disables.",
+							&appender_prealloc_chunk_kb,
+							1024, 0, 65536,
+							PGC_SIGHUP, GUC_UNIT_KB,
+							NULL, NULL, NULL);
 	MarkGUCPrefixReserved("immotus_appender");
 
 	appender_slot_ops = TTSOpsVirtual;

@@ -39,9 +39,13 @@ blocked by a trigger.
 
 Every change to segment files is WAL-logged by a custom resource manager, so
 streaming replication, point-in-time recovery, incremental backups and
-`pg_rewind` work. Touched segments are fsynced at commit, before the manifest
-update: a commit therefore costs one more fsync than on heap, which matters
-for single-row transactions and not for batched inserts.
+`pg_rewind` work. Touched segments are flushed with `fdatasync` at commit,
+before the manifest update: a commit therefore costs one more sync than on
+heap, which matters for single-row transactions and not for batched inserts.
+Segment files are zero-filled ahead in `immotus_appender.prealloc_chunk`
+(default 1 MB, 0 disables) chunks, so the `fdatasync` of a commit that stays
+inside a chunk does not pay for the file-size change. The physical file can be
+up to one chunk larger than its logical end.
 
 ## Status
 

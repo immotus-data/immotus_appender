@@ -73,7 +73,6 @@ extern void appender_seg_read_header(File file, int64 offset,
 extern void appender_seg_read_payload(File file, int64 offset,
 									  const AppenderBlockHeader *hdr,
 									  char *payload);
-extern void appender_seg_sync(File file);
 extern void appender_seg_unlink(const RelFileLocator *rlocator, int segno);
 extern int	appender_seg_unlink_all(const RelFileLocator *rlocator);
 extern int64 appender_seg_disk_size(const RelFileLocator *rlocator, int segno);
@@ -83,5 +82,10 @@ extern void appender_seg_redo_create(const RelFileLocator *rlocator, int segno);
 extern void appender_seg_redo_write(const RelFileLocator *rlocator, int segno,
 									int64 offset, const char *data, Size len);
 extern void appender_seg_redo_sync(const RelFileLocator *rlocator, int segno);
+
+/* Zero-fill past 'end'; commits inside the region fdatasync cheaply. */
+extern PGDLLIMPORT int appender_prealloc_chunk_kb;
+extern void appender_seg_ensure_room(File file, int64 end, int64 *horizon);
+extern void appender_seg_sync(File file);
 
 #endif							/* APPENDER_DATAFILE_H */

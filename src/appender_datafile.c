@@ -15,11 +15,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/xlog.h"
 #include "appender_datafile.h"
 #include "common/relpath.h"
+#include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
+
+int			appender_prealloc_chunk_kb = 1024;
 
 /*
  * The crc32c instruction has a latency of several cycles but a throughput of
@@ -261,14 +265,89 @@ appender_seg_read_payload(File file, int64 offset,
 						(long long) offset, FilePathName(file))));
 }
 
+/*
+ * Flush a segment.  fdatasync is enough: it syncs the data and the file size.
+ * On platforms that offer a write-through sync, honor wal_sync_method the way
+ * pg_fsync does, so fsync_writethrough keeps its stronger guarantee.
+ */
 void
 appender_seg_sync(File file)
 {
-	if (FileSync(file, WAIT_EVENT_DATA_FILE_SYNC) != 0)
+	int			fd;
+	int			rc;
+
+	if (!enableFsync)
+		return;
+	fd = FileGetRawDesc(file);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\" to sync: %m",
+						FilePathName(file))));
+	pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_SYNC);
+#ifdef HAVE_FSYNC_WRITETHROUGH
+	if (wal_sync_method == WAL_SYNC_METHOD_FSYNC_WRITETHROUGH)
+		rc = pg_fsync(fd);
+	else
+#endif
+		rc = pg_fdatasync(fd);
+	pgstat_report_wait_end();
+	if (rc != 0)
 		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(),
-				 errmsg("could not fsync file \"%s\": %m",
+				 errmsg("could not sync file \"%s\": %m",
 						FilePathName(file))));
+}
+
+/*
+ * Zero-fill the file past 'end', so later writes within the region do not
+ * grow the file and their fdatasync stays cheap.  '*horizon' is the already
+ * zero-filled extent, -1 when unknown (then it is read from the file size).
+ */
+void
+appender_seg_ensure_room(File file, int64 end, int64 *horizon)
+{
+	int64		chunk = (int64) appender_prealloc_chunk_kb * 1024;
+	int64		new_horizon;
+
+	if (chunk <= 0 || !enableFsync)
+	{
+		/* the file may grow without us; the cached horizon is stale */
+		*horizon = -1;
+		return;
+	}
+
+	if (*horizon < 0)
+	{
+		*horizon = (int64) FileSize(file);
+		if (*horizon < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not determine size of file \"%s\": %m",
+							FilePathName(file))));
+	}
+	if (end <= *horizon)
+		return;
+
+	new_horizon = *horizon + ((end - *horizon + chunk - 1) / chunk) * chunk;
+	if (FileZero(file, *horizon, new_horizon - *horizon,
+				 WAIT_EVENT_DATA_FILE_WRITE) != 0)
+	{
+		/*
+		 * Best effort: on a full disk skip the zero-fill.  fdatasync still
+		 * makes the data durable, it just pays for the file-size change.
+		 */
+		if (errno == ENOSPC)
+		{
+			*horizon = -1;
+			return;
+		}
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not preallocate file \"%s\": %m",
+						FilePathName(file))));
+	}
+	*horizon = new_horizon;
 }
 
 void
@@ -344,6 +423,7 @@ appender_seg_redo_write(const RelFileLocator *rlocator, int segno,
 {
 	char		path[MAXPGPATH];
 	File		file;
+	int64		horizon = -1;
 
 	appender_seg_path(rlocator, segno, path);
 	file = PathNameOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
@@ -351,6 +431,8 @@ appender_seg_redo_write(const RelFileLocator *rlocator, int segno,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", path)));
+
+	appender_seg_ensure_room(file, offset + (int64) len, &horizon);
 
 	if (FileWrite(file, data, len, offset, WAIT_EVENT_DATA_FILE_WRITE) != len)
 		ereport(ERROR,

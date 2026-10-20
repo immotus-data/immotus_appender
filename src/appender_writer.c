@@ -59,6 +59,7 @@ typedef struct AppenderWSeg
 	int64		start_eof;		/* committed position when claimed */
 	uint32		start_rows;
 	int64		eof;			/* current position, buffered rows included */
+	int64		horizon;		/* zero-filled extent, -1 when unknown */
 	uint32		rows;
 	AppenderCidMark *marks;
 	int			nmarks;
@@ -230,6 +231,7 @@ appender_add_seg(AppenderWriter *w, int segno, bool is_new, int64 eof,
 	seg->segno = segno;
 	seg->is_new = is_new;
 	seg->start_eof = seg->eof = eof;
+	seg->horizon = -1;
 	seg->start_rows = seg->rows = rows;
 	return seg;
 }
@@ -336,6 +338,8 @@ appender_buf_flush(AppenderWriter *w)
 	hdr.codec = APPENDER_CODEC_NONE;
 
 	file = appender_writer_file(w, seg->segno);
+	appender_seg_ensure_room(file, w->bufoff + appender_block_size(&hdr),
+							 &seg->horizon);
 	appender_seg_write_block(file, w->bufoff, &hdr, w->buf);
 	appender_xlog_block(&w->rlocator, seg->segno, w->bufoff, &hdr, w->buf);
 	FileWriteback(file, w->bufoff, appender_block_size(&hdr),
