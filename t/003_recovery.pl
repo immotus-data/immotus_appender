@@ -122,4 +122,83 @@ is( $primary->safe_psql('postgres',
 	'new timeline=500,shared=1000',
 	'a rewound node has the new timeline rows and none of its own');
 
+# --- local crash recovery --------------------------------------------------
+
+# With debug_log on, appender_redo reports every record it sees: "skip" when
+# a data record is not replayed after a local crash, "redo" when it is.
+my $dbg_conf = $conf
+  . "immotus_appender.debug_log = on\n"
+  . "log_min_messages = debug1\n";
+
+my $local = PostgreSQL::Test::Cluster->new('crash_local');
+$local->init(allows_streaming => 1);
+$local->append_conf('postgresql.conf', $dbg_conf);
+$local->start;
+$local->safe_psql('postgres', 'CREATE EXTENSION immotus_appender');
+$local->safe_psql('postgres', 'CREATE TABLE t (a int, b text) USING appender');
+$local->safe_psql('postgres',
+	"INSERT INTO t SELECT g, 'committed' FROM generate_series(1, 10000) g");
+
+# an open transaction leaves uncommitted blocks past the committed EOF; its
+# WAL records are also on disk, so crash recovery has to skip them too
+my $open = $local->background_psql('postgres');
+$open->query_safe('BEGIN');
+$open->query_safe(
+	"INSERT INTO t SELECT g, 'lost' FROM generate_series(1, 50000) g");
+
+# a fresh log captures only the crash-recovery output
+$local->rotate_logfile;
+$local->stop('immediate');
+$open->quit;
+$local->start;
+
+is($local->safe_psql('postgres', 'SELECT count(*) FROM t'),
+	'10000', 'a crashed primary keeps every committed row');
+my $local_log = PostgreSQL::Test::Utils::slurp_file($local->logfile);
+my $skipped = () = $local_log =~ /appender: skip /g;
+my $replayed = () = $local_log =~ /appender: redo /g;
+cmp_ok($skipped, '>', 0,
+	'crash recovery sees segment data records and skips them');
+is($replayed, 0,
+	'crash recovery replays no segment data records');
+
+# --- standby replay --------------------------------------------------------
+
+# A standby applies every WAL record through appender_redo in its startup
+# process, with standby.signal present: ArchiveRecoveryRequested stays true,
+# so no segment record is skipped there.
+my $sb_primary = PostgreSQL::Test::Cluster->new('sb_primary');
+$sb_primary->init(allows_streaming => 1);
+$sb_primary->append_conf('postgresql.conf',
+	$dbg_conf . "wal_keep_size = '320MB'\n");
+$sb_primary->start;
+$sb_primary->safe_psql('postgres', 'CREATE EXTENSION immotus_appender');
+$sb_primary->safe_psql('postgres',
+	'CREATE TABLE t (a int, b text) USING appender');
+$sb_primary->safe_psql('postgres',
+	"INSERT INTO t SELECT g, 'base' FROM generate_series(1, 10000) g");
+$sb_primary->backup('sb');
+
+my $sb_standby = PostgreSQL::Test::Cluster->new('sb_standby');
+$sb_standby->init_from_backup($sb_primary, 'sb', has_streaming => 1);
+$sb_standby->start;
+$sb_primary->wait_for_catchup($sb_standby);
+
+# count what the standby has replayed so far
+my $sb_logfile = $sb_standby->logfile;
+my $redo_before =
+  () = PostgreSQL::Test::Utils::slurp_file($sb_logfile) =~ /appender: redo /g;
+
+# new records stream in and are replayed by the standby's startup process
+$sb_primary->safe_psql('postgres',
+	"INSERT INTO t SELECT g, 'streamed' FROM generate_series(1, 10000) g");
+$sb_primary->wait_for_catchup($sb_standby);
+
+is($sb_standby->safe_psql('postgres', 'SELECT count(*) FROM t'),
+	'20000', 'a standby replays the primary appends');
+my $redo_after =
+  () = PostgreSQL::Test::Utils::slurp_file($sb_logfile) =~ /appender: redo /g;
+cmp_ok($redo_after, '>', $redo_before,
+	'a standby replays segment records via streaming');
+
 done_testing();

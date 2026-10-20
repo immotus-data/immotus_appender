@@ -42,6 +42,9 @@ typedef struct xl_appender_block
 	/* block header and payload follow */
 } xl_appender_block;
 
+/* Emit a DEBUG1 line for every replayed or skipped record (tests). */
+extern bool appender_debug_log;
+
 extern void appender_xlog_create(const RelFileLocator *rlocator, int segno);
 extern void appender_xlog_block(const RelFileLocator *rlocator, int segno,
 								int64 offset, const AppenderBlockHeader *hdr,

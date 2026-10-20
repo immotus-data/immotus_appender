@@ -1402,6 +1402,14 @@ _PG_init(void)
 							1024, 0, 65536,
 							PGC_SIGHUP, GUC_UNIT_KB,
 							NULL, NULL, NULL);
+	DefineCustomBoolVariable("immotus_appender.debug_log",
+							 "Emit a DEBUG1 line for every replayed or skipped segment record.",
+							 "For tests: proves which records crash recovery replays.",
+							 &appender_debug_log,
+							 false,
+							 PGC_SIGHUP,
+							 GUC_NO_SHOW_ALL,
+							 NULL, NULL, NULL);
 	MarkGUCPrefixReserved("immotus_appender");
 
 	appender_slot_ops = TTSOpsVirtual;

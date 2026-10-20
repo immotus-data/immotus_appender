@@ -8,8 +8,12 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xloginsert.h"
+#include "access/xlogutils.h"
 #include "appender_xlog.h"
+
+bool		appender_debug_log = false;
 
 void
 appender_xlog_create(const RelFileLocator *rlocator, int segno)
@@ -77,8 +81,29 @@ appender_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 	char	   *data = XLogRecGetData(record);
+	uint8		op = info & XLOG_APPENDER_OPMASK;
 
-	switch (info & XLOG_APPENDER_OPMASK)
+	/*
+	 * After a local crash the segment files already hold every committed
+	 * byte: dirty segments are synced before the commit record.  Data
+	 * records therefore do not need replaying in crash recovery.  UNLINK is
+	 * not covered by that guarantee (an unlink can be lost in a crash), so
+	 * it is always replayed.  Standbys and archive recovery set
+	 * ArchiveRecoveryRequested, so every record still replays there.
+	 */
+	if (op != XLOG_APPENDER_UNLINK &&
+		InRecovery && !ArchiveRecoveryRequested)
+	{
+		if (appender_debug_log)
+			elog(DEBUG1, "appender: skip %s redo in crash recovery",
+				 appender_identify(info));
+		return;
+	}
+
+	if (appender_debug_log)
+		elog(DEBUG1, "appender: redo %s", appender_identify(info));
+
+	switch (op)
 	{
 		case XLOG_APPENDER_CREATE:
 			{
