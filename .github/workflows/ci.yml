@@ -51,8 +51,30 @@ jobs:
       - name: Run tests
         run: make installcheck PG_CONFIG="$PG_PREFIX/bin/pg_config"
 
-      - name: Show test output on failure
+      - name: Collect logs on failure
         if: failure()
         run: |
+          "$PG_PREFIX/bin/postgres" --version > pg-version.txt 2>&1 || true
+          "$PG_PREFIX/bin/pg_config" --configure > pg-configure.txt 2>&1 || true
+          cp /tmp/data/log ./server.log 2>/dev/null || true
+          echo '--- server.log ---'
+          cat server.log 2>/dev/null || true
+          echo '--- regression.diffs ---'
           cat regression.diffs output_iso/regression.diffs 2>/dev/null || true
-          tail -n 100 tmp_check/log/* 2>/dev/null || true
+          echo '--- TAP logs ---'
+          tail -n 200 tmp_check/log/* 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: |
+            server.log
+            pg-version.txt
+            pg-configure.txt
+            regression.diffs
+            results/
+            output_iso/
+            tmp_check/
+          if-no-files-found: ignore
