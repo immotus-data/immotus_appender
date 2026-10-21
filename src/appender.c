@@ -1408,7 +1408,7 @@ _PG_init(void)
 							 &appender_debug_log,
 							 false,
 							 PGC_SIGHUP,
-							 GUC_NO_SHOW_ALL,
+							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 	MarkGUCPrefixReserved("immotus_appender");
 
