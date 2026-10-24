@@ -16,7 +16,7 @@ OBJS = \
 PGFILEDESC = "immotus_appender — append-only table access method for PostgreSQL"
 
 EXTENSION = immotus_appender
-DATA = immotus_appender--0.1.sql
+DATA = sql/immotus_appender--0.1.sql
 
 REGRESS = appender
 ISOLATION = concurrency
