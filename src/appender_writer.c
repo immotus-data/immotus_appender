@@ -19,7 +19,10 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
+#include "access/toast_internals.h"
+#include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/pg_type.h"
 #include "appender_datafile.h"
 #include "appender_lifecycle.h"
 #include "appender_metadata.h"
@@ -39,6 +42,7 @@
 
 #define APPENDER_BLOCK_TARGET		(32 * 1024)
 #define APPENDER_BLOCK_MAX_ROWS		4096
+#define APPENDER_TOAST_THRESHOLD	2048
 
 int			appender_segment_size_mb = 1024;
 
@@ -61,6 +65,10 @@ typedef struct AppenderWSeg
 	int64		eof;			/* current position, buffered rows included */
 	int64		horizon;		/* zero-filled extent, -1 when unknown */
 	uint32		rows;
+	int64		valdir_off;		/* offset of the newest directory block */
+	AppenderValDirEntry *pending; /* directory entries not yet flushed */
+	int			npending;
+	int			maxpending;
 	AppenderCidMark *marks;
 	int			nmarks;
 	int			maxmarks;
@@ -72,6 +80,7 @@ typedef struct AppenderWMark
 	int			nsegs;
 	int64		eof;
 	uint32		rows;
+	int64		valdir_off;
 	bool		sealed;
 	bool		sealed_here;
 	int			nmarks;
@@ -100,6 +109,8 @@ typedef struct AppenderWriter
 } AppenderWriter;
 
 static HTAB *appender_writers = NULL;
+static Oid appender_last_valueid = InvalidOid;
+static bool appender_valueid_wrapped = false;
 
 static void *
 appender_grow(void *array, int *max, Size elemsize)
@@ -220,7 +231,7 @@ appender_writer_has_seg(AppenderWriter *w, int segno)
 
 static AppenderWSeg *
 appender_add_seg(AppenderWriter *w, int segno, bool is_new, int64 eof,
-				 uint32 rows)
+				 uint32 rows, int64 valdir_off)
 {
 	AppenderWSeg *seg;
 
@@ -233,6 +244,10 @@ appender_add_seg(AppenderWriter *w, int segno, bool is_new, int64 eof,
 	seg->start_eof = seg->eof = eof;
 	seg->horizon = -1;
 	seg->start_rows = seg->rows = rows;
+	seg->valdir_off = valdir_off;
+	seg->pending = NULL;
+	seg->npending = 0;
+	seg->maxpending = 0;
 	return seg;
 }
 
@@ -241,6 +256,8 @@ appender_add_seg(AppenderWriter *w, int segno, bool is_new, int64 eof,
  * or else a new one.  Positions are re-read after the lock is taken, because
  * the previous holder may have committed in between.
  */
+static void appender_flush_valdir(AppenderWriter *w, AppenderWSeg *seg);
+
 static void
 appender_claim_segment(AppenderWriter *w)
 {
@@ -268,7 +285,8 @@ appender_claim_segment(AppenderWriter *w)
 			cur.state == APPENDER_SEG_OPEN)
 		{
 			AppenderWSeg *seg = appender_add_seg(w, segno, false, cur.eof,
-												 (uint32) cur.rowcount);
+												 (uint32) cur.rowcount,
+												 cur.valdir_off);
 
 			if (!appender_seg_full(seg))
 			{
@@ -298,7 +316,8 @@ appender_claim_segment(AppenderWriter *w)
 			if (cur.state == APPENDER_SEG_OPEN)
 			{
 				AppenderWSeg *seg = appender_add_seg(w, segno, false, cur.eof,
-													 (uint32) cur.rowcount);
+													 (uint32) cur.rowcount,
+													 cur.valdir_off);
 
 				if (!appender_seg_full(seg))
 					return;
@@ -313,7 +332,7 @@ appender_claim_segment(AppenderWriter *w)
 		w->file = appender_seg_create(&w->rlocator, segno);
 		w->file_segno = segno;
 		appender_xlog_create(&w->rlocator, segno);
-		appender_add_seg(w, segno, true, APPENDER_SEG_DATA_START, 0);
+		appender_add_seg(w, segno, true, APPENDER_SEG_DATA_START, 0, 0);
 		return;
 	}
 }
@@ -363,6 +382,8 @@ appender_writer_savepoint(AppenderWriter *w)
 		return;
 
 	appender_buf_flush(w);
+	if (appender_cur_seg(w) != NULL)
+		appender_flush_valdir(w, appender_cur_seg(w));
 
 	if (w->nstack == w->maxstack)
 		w->stack = appender_grow(w->stack, &w->maxstack, sizeof(AppenderWMark));
@@ -375,6 +396,7 @@ appender_writer_savepoint(AppenderWriter *w)
 	{
 		m->eof = seg->eof;
 		m->rows = seg->rows;
+		m->valdir_off = seg->valdir_off;
 		m->sealed = seg->sealed;
 		m->sealed_here = seg->sealed_here;
 		m->nmarks = seg->nmarks;
@@ -421,6 +443,286 @@ appender_buf_start(AppenderWriter *w, int natts)
 	w->bufnatts = natts;
 }
 
+static AppenderWSeg *
+appender_find_writer_seg(AppenderWriter *w, int segno)
+{
+	for (int i = 0; i < w->nsegs; i++)
+	{
+		if (w->segs[i].segno == segno)
+			return &w->segs[i];
+	}
+	return NULL;
+}
+
+static bool
+appender_segment_has_valueid(const RelFileLocator *rlocator, int segno,
+						 int64 hi, Oid valueid)
+{
+	AppenderBlockHeader hdr;
+	File		file;
+
+	if (hi <= APPENDER_SEG_DATA_START)
+		return false;
+
+	file = appender_seg_open(rlocator, segno);
+	for (int64 p = APPENDER_SEG_DATA_START; p < hi;)
+	{
+		appender_seg_read_header(file, p, &hdr);
+		if (p + appender_block_size(&hdr) > hi)
+			break;
+		if (hdr.kind == APPENDER_BLOCK_KIND_VALUE &&
+			hdr.first_rownum == valueid)
+		{
+			FileClose(file);
+			return true;
+		}
+		p += appender_block_size(&hdr);
+	}
+	FileClose(file);
+	return false;
+}
+
+static bool
+appender_valueid_exists(AppenderWriter *w, Oid valueid)
+{
+	AppenderSegment *meta;
+	int			nmeta;
+	bool		exists = false;
+
+	nmeta = appender_meta_segments(&w->rlocator, GetLatestSnapshot(), &meta);
+
+	for (int i = 0; i < nmeta && !exists; i++)
+	{
+		AppenderWSeg *own = appender_find_writer_seg(w, meta[i].segno);
+		int64		hi = meta[i].eof;
+
+		if (own)
+			hi = Max(hi, own->eof);
+		exists = appender_segment_has_valueid(&w->rlocator, meta[i].segno,
+										hi, valueid);
+	}
+
+	for (int i = 0; i < w->nsegs && !exists; i++)
+	{
+		bool		in_meta = false;
+
+		for (int j = 0; j < nmeta; j++)
+		{
+			if (meta[j].segno == w->segs[i].segno)
+			{
+				in_meta = true;
+				break;
+			}
+		}
+		if (in_meta)
+			continue;
+
+		exists = appender_segment_has_valueid(&w->rlocator, w->segs[i].segno,
+										w->segs[i].eof, valueid);
+	}
+
+	pfree(meta);
+	return exists;
+}
+
+/*
+ * Get a value identifier.  After this backend observes OID wrap-around,
+ * verify every candidate against existing value blocks to avoid collisions
+ * with very old pointers that still exist on disk.
+ */
+static Oid
+appender_allocate_valueid(AppenderWriter *w)
+{
+	for (int tries = 0; tries < 1024; tries++)
+	{
+		Oid			valueid = GetNewObjectId();
+
+		if (OidIsValid(appender_last_valueid) &&
+			valueid <= appender_last_valueid)
+			appender_valueid_wrapped = true;
+		appender_last_valueid = valueid;
+
+		if (!appender_valueid_wrapped || !appender_valueid_exists(w, valueid))
+			return valueid;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			 errmsg("could not allocate a unique external value identifier"),
+			 errhint("Retry the statement after reducing old data or restarting the session.")));
+}
+
+/*
+ * Store a varlena value in its own block and return the on-disk TOAST
+ * pointer that references it.  The pointer names our relation as the toast
+ * relation, so detoast dispatches to appender_fetch_toast_slice.
+ */
+static struct varlena *
+appender_externalize_value(AppenderWriter *w, AppenderWSeg *seg, Oid relid,
+						   struct varlena *value, char attstorage,
+						   char attcompression)
+{
+	struct varatt_external toast_pointer;
+	struct varlena *compressed = NULL;
+	struct varlena *stored = value;
+	struct varlena *result;
+	bool		compressed_owned = false;
+	Size		data_todo;
+	AppenderBlockHeader hdr;
+	File		file;
+	int64		off;
+
+	if (VARATT_IS_COMPRESSED(value))
+	{
+		/* already compressed (e.g. detoasted from a heap TOAST value) */
+		compressed = value;
+		stored = value;
+	}
+	else if (attstorage == TYPSTORAGE_EXTENDED)
+	{
+		Datum		c = toast_compress_datum(PointerGetDatum(value),
+											 attcompression);
+
+		if (DatumGetPointer(c) != NULL)
+		{
+			compressed = (struct varlena *) DatumGetPointer(c);
+			stored = compressed;
+			compressed_owned = true;
+		}
+	}
+
+	if (compressed)
+	{
+		data_todo = VARSIZE(compressed) - VARHDRSZ;
+		toast_pointer.va_rawsize =
+			VARDATA_COMPRESSED_GET_EXTSIZE(compressed) + VARHDRSZ;
+		VARATT_EXTERNAL_SET_SIZE_AND_COMPRESS_METHOD(toast_pointer, data_todo,
+													 VARDATA_COMPRESSED_GET_COMPRESS_METHOD(compressed));
+	}
+	else
+	{
+		data_todo = VARSIZE(value) - VARHDRSZ;
+		toast_pointer.va_rawsize = VARSIZE(value);
+		toast_pointer.va_extinfo = data_todo;
+	}
+	toast_pointer.va_valueid = appender_allocate_valueid(w);
+	toast_pointer.va_toastrelid = relid;
+
+	off = seg->eof;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.version = APPENDER_FORMAT_VERSION;
+	hdr.kind = APPENDER_BLOCK_KIND_VALUE;
+	hdr.rowcount = 1;
+	hdr.first_rownum = toast_pointer.va_valueid;
+	hdr.datalen = (uint32) data_todo;
+	hdr.rawlen = (uint32) (toast_pointer.va_rawsize - VARHDRSZ);
+	hdr.natts = 0;
+	hdr.codec = APPENDER_CODEC_NONE;
+
+	file = appender_writer_file(w, seg->segno);
+	appender_seg_ensure_room(file, off + appender_block_size(&hdr),
+							 &seg->horizon);
+	appender_seg_write_block(file, off, &hdr, VARDATA(stored));
+	appender_xlog_block(&w->rlocator, seg->segno, off, &hdr, VARDATA(stored));
+	FileWriteback(file, off, appender_block_size(&hdr),
+				  WAIT_EVENT_DATA_FILE_FLUSH);
+
+	seg->eof = off + appender_block_size(&hdr);
+	seg->dirty = true;
+
+	/* record the value in the segment's directory */
+	if (seg->npending == seg->maxpending)
+	{
+		int			newmax = seg->maxpending ? seg->maxpending * 2
+			: APPENDER_VALDIR_INTERVAL;
+
+		seg->pending = seg->pending
+			? repalloc(seg->pending, newmax * sizeof(AppenderValDirEntry))
+			: MemoryContextAlloc(TopTransactionContext,
+								 newmax * sizeof(AppenderValDirEntry));
+		seg->maxpending = newmax;
+	}
+	seg->pending[seg->npending].valueid = toast_pointer.va_valueid;
+	seg->pending[seg->npending].offset = off;
+	seg->npending++;
+	if (seg->npending >= APPENDER_VALDIR_INTERVAL)
+		appender_flush_valdir(w, seg);
+
+	if (compressed_owned)
+		pfree(compressed);
+
+	result = (struct varlena *) palloc(TOAST_POINTER_SIZE);
+	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK);
+	memcpy(VARDATA_EXTERNAL(result), &toast_pointer, sizeof(toast_pointer));
+	return result;
+}
+
+static int
+appender_valdir_entry_cmp(const void *a, const void *b)
+{
+	const AppenderValDirEntry *ea = (const AppenderValDirEntry *) a;
+	const AppenderValDirEntry *eb = (const AppenderValDirEntry *) b;
+
+	if (ea->valueid < eb->valueid)
+		return -1;
+	if (ea->valueid > eb->valueid)
+		return 1;
+	return 0;
+}
+
+/*
+ * Write the buffered directory entries as a VALDIR block chained to the
+ * previous one.  Flushed every APPENDER_VALDIR_INTERVAL values, at savepoints
+ * and at commit, so the open segment has a directory too and sealing stays a
+ * pure flag flip.  Entries are sorted so the reader can binary-search them.
+ */
+static void
+appender_flush_valdir(AppenderWriter *w, AppenderWSeg *seg)
+{
+	AppenderBlockHeader hdr;
+	File		file;
+	int64		off;
+	int64		datalen;
+	int64		prev_off = seg->valdir_off;
+	char	   *payload;
+
+	if (seg->npending == 0)
+		return;
+
+	qsort(seg->pending, seg->npending, sizeof(AppenderValDirEntry),
+		  appender_valdir_entry_cmp);
+
+	datalen = sizeof(int64) + seg->npending * sizeof(AppenderValDirEntry);
+	payload = palloc(datalen);
+	memcpy(payload, &prev_off, sizeof(int64));
+	memcpy(payload + sizeof(int64), seg->pending,
+		   seg->npending * sizeof(AppenderValDirEntry));
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.version = APPENDER_FORMAT_VERSION;
+	hdr.kind = APPENDER_BLOCK_KIND_VALDIR;
+	hdr.rowcount = (uint32) seg->npending;
+	hdr.first_rownum = seg->pending[0].valueid; /* smallest id after sorting */
+	hdr.datalen = hdr.rawlen = (uint32) datalen;
+	hdr.natts = 0;
+	hdr.codec = APPENDER_CODEC_NONE;
+
+	off = seg->eof;
+	file = appender_writer_file(w, seg->segno);
+	appender_seg_ensure_room(file, off + appender_block_size(&hdr),
+							 &seg->horizon);
+	appender_seg_write_block(file, off, &hdr, payload);
+	appender_xlog_block(&w->rlocator, seg->segno, off, &hdr, payload);
+	FileWriteback(file, off, appender_block_size(&hdr),
+				  WAIT_EVENT_DATA_FILE_FLUSH);
+
+	seg->eof = off + appender_block_size(&hdr);
+	seg->valdir_off = off;
+	seg->dirty = true;
+	seg->npending = 0;
+	pfree(payload);
+}
+
 void
 appender_writer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 {
@@ -432,6 +734,7 @@ appender_writer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 	MemTuple	mtup;
 	uint32		mtsize;
 	AppenderWSeg *seg;
+	bool		need_ext = false;
 
 	CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
 	appender_writer_savepoint(w);
@@ -459,16 +762,102 @@ appender_writer_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 		values[i] = PointerGetDatum(detoast_external_attr(v));
 	}
 
+	/* Externalizing needs a fresh block, so it can start after value blocks. */
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+		struct varlena *v;
+
+		if (isnull[i] || attr->attlen != -1)
+			continue;
+		if (attr->attstorage != TYPSTORAGE_EXTENDED &&
+			attr->attstorage != TYPSTORAGE_EXTERNAL)
+			continue;
+		v = (struct varlena *) DatumGetPointer(values[i]);
+		if (VARATT_IS_EXTERNAL(v) || VARATT_IS_SHORT(v))
+			continue;
+		if (VARSIZE(v) - VARHDRSZ <= APPENDER_TOAST_THRESHOLD)
+			continue;
+		need_ext = true;
+		break;
+	}
+
+	/* STORAGE MAIN values are compressed inline and never toasted. */
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+		struct varlena *v;
+
+		if (isnull[i] || attr->attlen != -1 ||
+			attr->attstorage != TYPSTORAGE_MAIN)
+			continue;
+		v = (struct varlena *) DatumGetPointer(values[i]);
+		if (VARATT_IS_EXTERNAL(v) || VARATT_IS_SHORT(v))
+			continue;
+		if (VARSIZE(v) - VARHDRSZ <= APPENDER_TOAST_THRESHOLD)
+			continue;
+		if (!VARATT_IS_COMPRESSED(v))
+		{
+			Datum		c = toast_compress_datum(PointerGetDatum(v),
+												 attr->attcompression);
+
+			if (DatumGetPointer(c) != NULL)
+			{
+				if (detoasted == NULL)
+				{
+					detoasted = palloc(desc->natts * sizeof(Datum));
+					memcpy(detoasted, values, desc->natts * sizeof(Datum));
+					values = detoasted;
+				}
+				values[i] = c;
+			}
+		}
+	}
+
+	if (w->bufrows > 0 && (w->bufnatts != desc->natts || need_ext))
+		appender_buf_flush(w);
+	if (w->bufrows == 0)
+		appender_buf_start(w, desc->natts);
+	seg = appender_cur_seg(w);
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+		struct varlena *v;
+
+		if (isnull[i] || attr->attlen != -1)
+			continue;
+		if (attr->attstorage != TYPSTORAGE_EXTENDED &&
+			attr->attstorage != TYPSTORAGE_EXTERNAL)
+			continue;
+		v = (struct varlena *) DatumGetPointer(values[i]);
+		if (VARATT_IS_EXTERNAL(v) || VARATT_IS_SHORT(v))
+			continue;
+		if (VARSIZE(v) - VARHDRSZ <= APPENDER_TOAST_THRESHOLD)
+			continue;
+
+		values[i] = PointerGetDatum(appender_externalize_value(w, seg,
+															  RelationGetRelid(rel),
+															  v, attr->attstorage,
+															  attr->attcompression));
+	}
+
+	if (need_ext)
+	{
+		w->bufoff = seg->eof;
+		w->buffirst = seg->rows;
+	}
+
 	mtup = memtuple_form(appender_binding(rel, desc->natts), values, isnull);
 	mtsize = memtuple_get_size(mtup);
 
 	if (w->bufrows > 0 &&
-		(w->bufnatts != desc->natts ||
-		 w->buflen + mtsize > APPENDER_BLOCK_TARGET ||
+		(w->buflen + mtsize > APPENDER_BLOCK_TARGET ||
 		 w->bufrows >= APPENDER_BLOCK_MAX_ROWS))
+	{
 		appender_buf_flush(w);
-	if (w->bufrows == 0)
 		appender_buf_start(w, desc->natts);
+	}
 
 	if (w->buflen + mtsize > w->bufcap)
 	{
@@ -668,6 +1057,8 @@ appender_writer_pre_commit(void)
 			continue;
 
 		appender_buf_flush(w);
+		for (int i = 0; i < w->nsegs; i++)
+			appender_flush_valdir(w, &w->segs[i]);
 
 		for (int i = 0; i < w->nsegs; i++)
 		{
@@ -695,13 +1086,15 @@ appender_writer_pre_commit(void)
 			AppenderWSeg *seg = &w->segs[i];
 			AppenderSegment row;
 
-			if (!seg->is_new && !seg->sealed_here && seg->rows == seg->start_rows)
+			if (!seg->is_new && !seg->sealed_here &&
+				seg->rows == seg->start_rows)
 				continue;
 
 			row.segno = seg->segno;
 			row.state = seg->sealed ? APPENDER_SEG_SEALED : APPENDER_SEG_OPEN;
 			row.eof = seg->eof;
 			row.rowcount = seg->rows;
+			row.valdir_off = seg->valdir_off;
 			appender_meta_store(&w->rlocator, &row);
 		}
 	}
@@ -743,6 +1136,8 @@ appender_writer_restore(AppenderWriter *w, const AppenderWMark *m)
 
 		seg->eof = m->eof;
 		seg->rows = m->rows;
+		seg->valdir_off = m->valdir_off;
+		seg->npending = 0;
 		seg->sealed = m->sealed;
 		seg->sealed_here = m->sealed_here;
 		seg->nmarks = m->nmarks;

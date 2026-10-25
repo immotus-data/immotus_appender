@@ -25,7 +25,12 @@
 #define APPENDER_FORMAT_VERSION		1
 
 #define APPENDER_BLOCK_KIND_DATA	1
+#define APPENDER_BLOCK_KIND_VALUE	2
+#define APPENDER_BLOCK_KIND_VALDIR	3
 #define APPENDER_CODEC_NONE			0
+
+/* Values buffered in one directory block before it is flushed. */
+#define APPENDER_VALDIR_INTERVAL	64
 
 typedef struct AppenderFileHeader
 {
@@ -52,6 +57,13 @@ typedef struct AppenderBlockHeader
 
 StaticAssertDecl(sizeof(AppenderFileHeader) == 32, "file header must be 32 bytes");
 StaticAssertDecl(sizeof(AppenderBlockHeader) == 32, "block header must be 32 bytes");
+
+/* One entry of a value directory block: (valueid, byte offset of value block). */
+typedef struct AppenderValDirEntry
+{
+	Oid			valueid;
+	int64		offset;
+} AppenderValDirEntry;
 
 #define APPENDER_SEG_DATA_START		((int64) sizeof(AppenderFileHeader))
 

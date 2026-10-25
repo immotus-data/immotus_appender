@@ -25,6 +25,7 @@ typedef struct AppenderSegment
 	int16		state;
 	int64		eof;			/* committed logical end of the segment file */
 	int64		rowcount;		/* committed rows in the segment */
+	int64		valdir_off;		/* committed offset of the value directory */
 } AppenderSegment;
 
 extern Oid	appender_meta_relid(bool missing_ok);

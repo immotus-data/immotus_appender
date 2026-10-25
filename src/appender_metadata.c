@@ -3,37 +3,47 @@
  * appender_metadata.c
  *    Segment manifest of appender tables.
  *
- * The manifest is maintained with the CatalogTuple* routines, which bypass
- * triggers but keep its unique index (spcoid, relfilenode, segno) up to date.
- * Every lookup is an index scan, so its cost does not grow with the number
- * of appender tables.
+ * appender_meta is an ordinary heap table.  It is modified with the heap AM
+ * directly (bypassing the guard trigger) and its indexes are maintained here.
+ * Every lookup is an index scan on (spcoid, relfilenode, segno), so its cost
+ * does not grow with the number of appender tables.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "appender_datafile.h"
 #include "appender_metadata.h"
-#include "catalog/indexing.h"
+#include "catalog/index.h"
 #include "commands/extension.h"
+#include "executor/tuptable.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
-#define Natts_appender_meta				7
+#define Natts_appender_meta				8
+
 #define Anum_appender_meta_spcoid		1
 #define Anum_appender_meta_relfilenode	2
 #define Anum_appender_meta_segno		3
 #define Anum_appender_meta_state		4
 #define Anum_appender_meta_eof			5
 #define Anum_appender_meta_rowcount		6
-#define Anum_appender_meta_version		7
+#define Anum_appender_meta_valdir_off	7
+#define Anum_appender_meta_version		8
+
+/* Column numbers within the appender_meta_key index. */
+#define Anum_appender_meta_key_spcoid		1
+#define Anum_appender_meta_key_relfilenode	2
+#define Anum_appender_meta_key_segno		3
 
 static Oid	appender_meta_oid = InvalidOid;
 static Oid	appender_meta_index_oid = InvalidOid;
@@ -80,38 +90,114 @@ appender_meta_invalidate(Oid relid)
 }
 
 static void
-appender_meta_row(HeapTuple tup, TupleDesc desc, AppenderSegment *seg)
+appender_meta_row(TupleTableSlot *slot, AppenderSegment *seg)
 {
-	Datum		values[Natts_appender_meta];
-	bool		nulls[Natts_appender_meta];
-
-	heap_deform_tuple(tup, desc, values, nulls);
-	seg->segno = DatumGetInt32(values[Anum_appender_meta_segno - 1]);
-	seg->state = DatumGetInt16(values[Anum_appender_meta_state - 1]);
-	seg->eof = DatumGetInt64(values[Anum_appender_meta_eof - 1]);
-	seg->rowcount = DatumGetInt64(values[Anum_appender_meta_rowcount - 1]);
+	slot_getallattrs(slot);
+	seg->segno = DatumGetInt32(slot->tts_values[Anum_appender_meta_segno - 1]);
+	seg->state = DatumGetInt16(slot->tts_values[Anum_appender_meta_state - 1]);
+	seg->eof = DatumGetInt64(slot->tts_values[Anum_appender_meta_eof - 1]);
+	seg->rowcount = DatumGetInt64(slot->tts_values[Anum_appender_meta_rowcount - 1]);
+	seg->valdir_off = DatumGetInt64(slot->tts_values[Anum_appender_meta_valdir_off - 1]);
 }
 
 /* Index scan over a storage's rows, or one segment's row if segno > 0. */
-static SysScanDesc
-appender_meta_beginscan(Relation meta, const RelFileLocator *rlocator,
-						int segno, Snapshot snapshot, ScanKeyData *keys)
+static IndexScanDesc
+appender_meta_beginscan(Relation meta, Relation index,
+						const RelFileLocator *rlocator, int segno,
+						Snapshot snapshot, ScanKeyData *keys)
 {
 	int			nkeys = 2;
+	IndexScanDesc scan;
 
-	ScanKeyInit(&keys[0], Anum_appender_meta_spcoid, BTEqualStrategyNumber,
+	ScanKeyInit(&keys[0], Anum_appender_meta_key_spcoid, BTEqualStrategyNumber,
 				F_OIDEQ, ObjectIdGetDatum(rlocator->spcOid));
-	ScanKeyInit(&keys[1], Anum_appender_meta_relfilenode, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(rlocator->relNumber));
+	ScanKeyInit(&keys[1], Anum_appender_meta_key_relfilenode,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(rlocator->relNumber));
 	if (segno > 0)
 	{
-		ScanKeyInit(&keys[2], Anum_appender_meta_segno, BTEqualStrategyNumber,
-					F_INT4EQ, Int32GetDatum(segno));
+		ScanKeyInit(&keys[2], Anum_appender_meta_key_segno,
+					BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(segno));
 		nkeys = 3;
 	}
 
-	return systable_beginscan(meta, appender_meta_index_oid, true, snapshot,
-							  nkeys, keys);
+	scan = index_beginscan(meta, index, snapshot, NULL, nkeys, 0);
+	index_rescan(scan, keys, nkeys, NULL, 0);
+	return scan;
+}
+
+/* One segment's row visible under snapshot: its contents and/or its TID. */
+static bool
+appender_meta_fetch(Relation meta, const RelFileLocator *rlocator, int segno,
+					Snapshot snapshot, AppenderSegment *seg, ItemPointer tid)
+{
+	Relation	index = index_open(appender_meta_index_oid, AccessShareLock);
+	Snapshot	snap = RegisterSnapshot(snapshot);
+	TupleTableSlot *slot = table_slot_create(meta, NULL);
+	ScanKeyData keys[3];
+	IndexScanDesc scan = appender_meta_beginscan(meta, index, rlocator, segno,
+												 snap, keys);
+	bool		found = index_getnext_slot(scan, ForwardScanDirection, slot);
+
+	if (found)
+	{
+		if (seg)
+			appender_meta_row(slot, seg);
+		if (tid)
+			*tid = slot->tts_tid;
+	}
+
+	index_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	UnregisterSnapshot(snap);
+	index_close(index, AccessShareLock);
+	return found;
+}
+
+/*
+ * Add index entries for a heap tuple of appender_meta just inserted or
+ * updated, as the executor would.  Only plain-column indexes are supported.
+ */
+static void
+appender_meta_index_insert(Relation meta, HeapTuple tup,
+						   TU_UpdateIndexes update_indexes)
+{
+	List	   *indexes;
+	ListCell   *lc;
+
+	if (update_indexes == TU_None)
+		return;
+
+	indexes = RelationGetIndexList(meta);
+	foreach(lc, indexes)
+	{
+		Relation	index = index_open(lfirst_oid(lc), RowExclusiveLock);
+		IndexInfo  *info = BuildIndexInfo(index);
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+
+		if (info->ii_ReadyForInserts &&
+			(update_indexes == TU_All || info->ii_Summarizing))
+		{
+			if (info->ii_Expressions != NIL || info->ii_Predicate != NIL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("expression or partial index \"%s\" on appender_meta is not supported",
+								RelationGetRelationName(index))));
+
+			for (int i = 0; i < info->ii_NumIndexAttrs; i++)
+				values[i] = heap_getattr(tup, info->ii_IndexAttrNumbers[i],
+										 RelationGetDescr(meta), &isnull[i]);
+
+			index_insert(index, values, isnull, &tup->t_self, meta,
+						 index->rd_index->indisunique ?
+						 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
+						 false, info);
+			index_insert_cleanup(index, info);
+		}
+		index_close(index, RowExclusiveLock);
+	}
+	list_free(indexes);
 }
 
 /*
@@ -123,26 +209,30 @@ appender_meta_segments(const RelFileLocator *rlocator, Snapshot snapshot,
 					   AppenderSegment **segs)
 {
 	Relation	meta = table_open(appender_meta_relid(false), AccessShareLock);
+	Relation	index = index_open(appender_meta_index_oid, AccessShareLock);
 	Snapshot	snap = RegisterSnapshot(snapshot);
+	TupleTableSlot *slot = table_slot_create(meta, NULL);
 	ScanKeyData keys[3];
-	SysScanDesc scan = appender_meta_beginscan(meta, rlocator, 0, snap, keys);
-	HeapTuple	tup;
+	IndexScanDesc scan = appender_meta_beginscan(meta, index, rlocator, 0,
+												 snap, keys);
 	int			n = 0;
 	int			cap = 8;
 	AppenderSegment *out = palloc(cap * sizeof(AppenderSegment));
 
-	while ((tup = systable_getnext(scan)) != NULL)
+	while (index_getnext_slot(scan, ForwardScanDirection, slot))
 	{
 		if (n == cap)
 		{
 			cap *= 2;
 			out = repalloc(out, cap * sizeof(AppenderSegment));
 		}
-		appender_meta_row(tup, RelationGetDescr(meta), &out[n++]);
+		appender_meta_row(slot, &out[n++]);
 	}
 
-	systable_endscan(scan);
+	index_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
 	UnregisterSnapshot(snap);
+	index_close(index, AccessShareLock);
 	table_close(meta, AccessShareLock);
 
 	*segs = out;
@@ -154,44 +244,29 @@ appender_meta_get(const RelFileLocator *rlocator, int segno, Snapshot snapshot,
 				  AppenderSegment *seg)
 {
 	Relation	meta = table_open(appender_meta_relid(false), AccessShareLock);
-	Snapshot	snap = RegisterSnapshot(snapshot);
-	ScanKeyData keys[3];
-	SysScanDesc scan = appender_meta_beginscan(meta, rlocator, segno, snap, keys);
-	HeapTuple	tup = systable_getnext(scan);
-	bool		found = HeapTupleIsValid(tup);
+	bool		found = appender_meta_fetch(meta, rlocator, segno, snapshot,
+										seg, NULL);
 
-	if (found)
-		appender_meta_row(tup, RelationGetDescr(meta), seg);
-
-	systable_endscan(scan);
-	UnregisterSnapshot(snap);
 	table_close(meta, AccessShareLock);
 	return found;
 }
 
 /*
  * Insert or update a segment's row.  The caller holds the segment lock, so
- * no other transaction updates the same row concurrently.
+ * no other transaction updates the same row concurrently; simple_heap_update
+ * errors out if that is ever violated.
  */
 void
 appender_meta_store(const RelFileLocator *rlocator, const AppenderSegment *seg)
 {
 	Relation	meta = table_open(appender_meta_relid(false), RowExclusiveLock);
-	Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
-	ScanKeyData keys[3];
-	SysScanDesc scan = appender_meta_beginscan(meta, rlocator, seg->segno,
-											   snap, keys);
-	HeapTuple	old = systable_getnext(scan);
 	ItemPointerData oldtid;
-	bool		found = HeapTupleIsValid(old);
+	bool		found = appender_meta_fetch(meta, rlocator, seg->segno,
+										GetLatestSnapshot(), NULL, &oldtid);
 	Datum		values[Natts_appender_meta];
 	bool		nulls[Natts_appender_meta] = {0};
 	HeapTuple	tup;
-
-	if (found)
-		oldtid = old->t_self;
-	systable_endscan(scan);
-	UnregisterSnapshot(snap);
+	TU_UpdateIndexes update_indexes = TU_All;
 
 	values[Anum_appender_meta_spcoid - 1] = ObjectIdGetDatum(rlocator->spcOid);
 	values[Anum_appender_meta_relfilenode - 1] = ObjectIdGetDatum(rlocator->relNumber);
@@ -199,13 +274,15 @@ appender_meta_store(const RelFileLocator *rlocator, const AppenderSegment *seg)
 	values[Anum_appender_meta_state - 1] = Int16GetDatum(seg->state);
 	values[Anum_appender_meta_eof - 1] = Int64GetDatum(seg->eof);
 	values[Anum_appender_meta_rowcount - 1] = Int64GetDatum(seg->rowcount);
+	values[Anum_appender_meta_valdir_off - 1] = Int64GetDatum(seg->valdir_off);
 	values[Anum_appender_meta_version - 1] = Int16GetDatum(APPENDER_FORMAT_VERSION);
 
 	tup = heap_form_tuple(RelationGetDescr(meta), values, nulls);
 	if (found)
-		CatalogTupleUpdate(meta, &oldtid, tup);
+		simple_heap_update(meta, &oldtid, tup, &update_indexes);
 	else
-		CatalogTupleInsert(meta, tup);
+		simple_heap_insert(meta, tup);
+	appender_meta_index_insert(meta, tup, update_indexes);
 	heap_freetuple(tup);
 
 	table_close(meta, RowExclusiveLock);
@@ -217,10 +294,11 @@ appender_meta_delete(const RelFileLocator *rlocator)
 {
 	Oid			metaid = appender_meta_relid(true);
 	Relation	meta;
+	Relation	index;
 	Snapshot	snap;
+	TupleTableSlot *slot;
 	ScanKeyData keys[3];
-	SysScanDesc scan;
-	HeapTuple	tup;
+	IndexScanDesc scan;
 	List	   *tids = NIL;
 	ListCell   *lc;
 
@@ -230,20 +308,25 @@ appender_meta_delete(const RelFileLocator *rlocator)
 		return;
 
 	meta = table_open(metaid, RowExclusiveLock);
+	index = index_open(appender_meta_index_oid, AccessShareLock);
 	snap = RegisterSnapshot(GetLatestSnapshot());
-	scan = appender_meta_beginscan(meta, rlocator, 0, snap, keys);
-	while ((tup = systable_getnext(scan)) != NULL)
+	slot = table_slot_create(meta, NULL);
+	scan = appender_meta_beginscan(meta, index, rlocator, 0, snap, keys);
+	while (index_getnext_slot(scan, ForwardScanDirection, slot))
 	{
 		ItemPointer tid = palloc(sizeof(ItemPointerData));
 
-		*tid = tup->t_self;
+		*tid = slot->tts_tid;
 		tids = lappend(tids, tid);
 	}
-	systable_endscan(scan);
+	index_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
 	UnregisterSnapshot(snap);
+	index_close(index, AccessShareLock);
 
+	/* deletion needs no index work: dead entries are removed by vacuum */
 	foreach(lc, tids)
-		CatalogTupleDelete(meta, (ItemPointer) lfirst(lc));
+		simple_heap_delete(meta, (ItemPointer) lfirst(lc));
 	list_free_deep(tids);
 
 	table_close(meta, RowExclusiveLock);

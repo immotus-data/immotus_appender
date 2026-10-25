@@ -31,6 +31,11 @@ is sealed once it reaches `immotus_appender.segment_size` and is immutable from
 then on. Every block carries a checksum. A row's TID is logical:
 (segment, row number), independent of where the row is stored.
 
+Large varlena values are stored in dedicated value blocks and referenced by
+standard TOAST pointers. Sealed segments use a value directory (VALDIR) so
+value lookups are indexed instead of scanned; the per-backend cache for this
+directory is bounded by `immotus_appender.valdir_cache_size`.
+
 The `appender_meta` table (in the extension's schema) is the manifest: one row
 per segment with its committed end. A transaction's appends become visible
 when its manifest update commits, so appends are atomic and MVCC-correct.
@@ -49,9 +54,10 @@ up to one chunk larger than its logical end.
 
 ## Status
 
-Version 0.1 (in development). Supported: `INSERT`, `COPY`, sequential and
+Version 1.0 (in development). Supported: `INSERT`, `COPY`, sequential and
 parallel scans, savepoints, `TRUNCATE`, `ALTER TABLE` (including rewrites and
-`SET ACCESS METHOD`), `ANALYZE`, partitioning, streaming replication, PITR.
+`SET ACCESS METHOD`), `ANALYZE`, partitioning, large varlena storage
+(`EXTENDED`/`EXTERNAL`/`MAIN` semantics), streaming replication, PITR.
 
 Not supported: `UPDATE`, `DELETE`, `INSERT ... ON CONFLICT`, indexes, backward
 scans, `TABLESAMPLE`, unlogged and temporary tables, two-phase commit,

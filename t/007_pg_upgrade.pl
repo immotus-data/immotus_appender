@@ -30,11 +30,14 @@ CREATE TABLE t (a int, b text) USING appender;
 INSERT INTO t (a, b)
   SELECT g, CASE WHEN g % 11 = 0 THEN NULL ELSE 'v' || g END
     FROM generate_series(1, 50000) g;
+CREATE TABLE big (id int, t text) USING appender;
+INSERT INTO big VALUES (1, repeat('x', 100000));
 SQL
 
 my $check = "SELECT count(*), sum(a), count(b),
        md5(string_agg(COALESCE(b, '<null>'), ',' ORDER BY a)) FROM t";
 my $expected = $old->safe_psql('postgres', $check);
+my $big_check = "SELECT id, length(t), left(t, 3) FROM big";
 
 # pg_upgrade needs the old cluster down and cleanly shut down: a fast stop
 # checkpoints, so the committed segments are on disk with no replay pending.
@@ -95,6 +98,8 @@ $new->start;
 
 is($new->safe_psql('postgres', $check),
 	$expected, 'pg_upgrade preserves every appender row');
+is($new->safe_psql('postgres', $big_check),
+	'1|100000|xxx', 'pg_upgrade keeps external value pointers valid');
 $new->safe_psql('postgres',
 	"INSERT INTO t (a, b) VALUES (60000, 'post-upgrade')");
 is($new->safe_psql('postgres', "SELECT count(*) FROM t WHERE a = 60000"),

@@ -85,19 +85,31 @@ appender_redo(XLogReaderState *record)
 
 	/*
 	 * After a local crash the segment files already hold every committed
-	 * byte: dirty segments are synced before the commit record.  Data
-	 * records therefore do not need replaying in crash recovery.  UNLINK is
-	 * not covered by that guarantee (an unlink can be lost in a crash), so
-	 * it is always replayed.  Standbys and archive recovery set
-	 * ArchiveRecoveryRequested, so every record still replays there.
+	 * byte: dirty segments are synced before the commit record, so CREATE,
+	 * BLOCK and SYNC records need no replay there.  Single-segment UNLINK
+	 * records are only ever emitted for segments that never committed (see
+	 * appender_unlink_new_segs), and their segment number can later be
+	 * reused by a committed segment; replaying one could delete that
+	 * committed file, so skip those too.  A whole-storage UNLINK (segno 0)
+	 * must always replay: it is flushed after the commit record, so without
+	 * it a crash could leave orphan files.  Standbys and archive recovery
+	 * set ArchiveRecoveryRequested, so every record still replays there.
 	 */
-	if (op != XLOG_APPENDER_UNLINK &&
-		InRecovery && !ArchiveRecoveryRequested)
+	if (InRecovery && !ArchiveRecoveryRequested)
 	{
-		if (appender_debug_log)
-			elog(DEBUG1, "appender: skip %s redo in crash recovery",
-				 appender_identify(info));
-		return;
+		bool		must_replay = false;
+
+		if (op == XLOG_APPENDER_UNLINK &&
+			((xl_appender_seg *) data)->segno == 0)
+			must_replay = true;
+
+		if (!must_replay)
+		{
+			if (appender_debug_log)
+				elog(DEBUG1, "appender: skip %s redo in crash recovery",
+					 appender_identify(info));
+			return;
+		}
 	}
 
 	if (appender_debug_log)

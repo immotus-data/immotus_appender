@@ -234,15 +234,31 @@ appender_seg_read_header(File file, int64 offset, AppenderBlockHeader *hdr)
 						(long long) offset, FilePathName(file))));
 
 	if (hdr->version != APPENDER_FORMAT_VERSION ||
-		hdr->kind != APPENDER_BLOCK_KIND_DATA ||
+		(hdr->kind != APPENDER_BLOCK_KIND_DATA &&
+		 hdr->kind != APPENDER_BLOCK_KIND_VALUE &&
+		 hdr->kind != APPENDER_BLOCK_KIND_VALDIR) ||
 		hdr->codec != APPENDER_CODEC_NONE ||
 		hdr->rowcount == 0 ||
-		hdr->rawlen != hdr->datalen ||
-		hdr->datalen % MAXIMUM_ALIGNOF != 0 ||
 		!AllocSizeIsValid(hdr->datalen))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid block header at offset %lld of file \"%s\"",
+						(long long) offset, FilePathName(file))));
+
+	if (hdr->kind == APPENDER_BLOCK_KIND_DATA)
+	{
+		if (hdr->rawlen != hdr->datalen ||
+			hdr->datalen % MAXIMUM_ALIGNOF != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid data block header at offset %lld of file \"%s\"",
+							(long long) offset, FilePathName(file))));
+	}
+	else if (hdr->kind == APPENDER_BLOCK_KIND_VALUE &&
+			 hdr->rawlen < hdr->datalen)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid value block header at offset %lld of file \"%s\"",
 						(long long) offset, FilePathName(file))));
 }
 

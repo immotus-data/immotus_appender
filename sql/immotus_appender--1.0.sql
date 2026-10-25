@@ -1,4 +1,4 @@
-/* immotus_appender--0.1.sql */
+/* immotus_appender--1.0.sql */
 
 \echo Use "CREATE EXTENSION immotus_appender" to load this file. \quit
 
@@ -23,6 +23,7 @@ CREATE TABLE appender_meta
     state           int2     NOT NULL,
     eof             int8     NOT NULL,
     rowcount        int8     NOT NULL,
+    valdir_off      int8     NOT NULL,
     format_version  int2     NOT NULL
 );
 
