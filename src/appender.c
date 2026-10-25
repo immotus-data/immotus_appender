@@ -734,6 +734,7 @@ static struct
 	int64		range_start;
 	int64		blockoff;
 	uint32		first;
+	uint64		generation;		/* appender_seg_generation when filled */
 	bool		valid;
 }			appender_fetch_cache;
 
@@ -887,6 +888,7 @@ appender_valdir_load(const RelFileLocator *rlocator, int segno, int64 valdir_off
 	int			total = 0;
 	int			cap = 256;
 	int64		doff = valdir_off;
+	volatile File file = -1;
 	Size		bytes;
 
 	if (appender_valdir_cache == NULL)
@@ -908,55 +910,68 @@ appender_valdir_load(const RelFileLocator *rlocator, int segno, int64 valdir_off
 	}
 
 	all = palloc(cap * sizeof(AppenderValDirEntry));
-	while (doff > 0)
+	PG_TRY();
 	{
-		int64		cur = doff;
-		File		file = appender_seg_open(rlocator, segno);
-		AppenderBlockHeader hdr;
-		char	   *payload;
-		int			n;
-		int64		expected;
+		if (doff > 0)
+			file = appender_seg_open(rlocator, segno);
 
-		appender_seg_read_header(file, doff, &hdr);
-		if (hdr.kind != APPENDER_BLOCK_KIND_VALDIR)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("invalid value directory at offset %lld of segment %d of relation %u/%u/%u",
-							(long long) doff, segno,
-							rlocator->spcOid, rlocator->dbOid,
-							rlocator->relNumber)));
-		payload = palloc(hdr.datalen);
-		appender_seg_read_payload(file, doff, &hdr, payload);
-		FileClose(file);
-
-		n = (int) hdr.rowcount;
-		expected = sizeof(int64) + (int64) n * sizeof(AppenderValDirEntry);
-		if (expected != hdr.datalen)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("invalid value directory payload at offset %lld of segment %d of relation %u/%u/%u",
-							(long long) doff, segno,
-							rlocator->spcOid, rlocator->dbOid,
-							rlocator->relNumber)));
-
-		if (total + n > cap)
+		while (doff > 0)
 		{
-			while (total + n > cap)
-				cap *= 2;
-			all = repalloc(all, cap * sizeof(AppenderValDirEntry));
+			int64		cur = doff;
+			AppenderBlockHeader hdr;
+			char	   *payload;
+			int			n;
+			int64		expected;
+
+			appender_seg_read_header(file, doff, &hdr);
+			if (hdr.kind != APPENDER_BLOCK_KIND_VALDIR)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("invalid value directory at offset %lld of segment %d of relation %u/%u/%u",
+								(long long) doff, segno,
+								rlocator->spcOid, rlocator->dbOid,
+								rlocator->relNumber)));
+			payload = palloc(hdr.datalen);
+			appender_seg_read_payload(file, doff, &hdr, payload);
+
+			n = (int) hdr.rowcount;
+			expected = sizeof(int64) + (int64) n * sizeof(AppenderValDirEntry);
+			if (expected != hdr.datalen)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("invalid value directory payload at offset %lld of segment %d of relation %u/%u/%u",
+								(long long) doff, segno,
+								rlocator->spcOid, rlocator->dbOid,
+								rlocator->relNumber)));
+
+			if (total + n > cap)
+			{
+				while (total + n > cap)
+					cap *= 2;
+				all = repalloc(all, cap * sizeof(AppenderValDirEntry));
+			}
+			memcpy(all + total, payload + sizeof(int64),
+				   n * sizeof(AppenderValDirEntry));
+			total += n;
+			doff = *(int64 *) payload;
+			if (doff != 0 && (doff < APPENDER_SEG_DATA_START || doff >= cur))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("invalid value directory chain link in segment %d of relation %u/%u/%u",
+								segno, rlocator->spcOid, rlocator->dbOid,
+								rlocator->relNumber)));
+			pfree(payload);
 		}
-		memcpy(all + total, payload + sizeof(int64),
-			   n * sizeof(AppenderValDirEntry));
-		total += n;
-		doff = *(int64 *) payload;
-		if (doff != 0 && (doff < APPENDER_SEG_DATA_START || doff >= cur))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("invalid value directory chain link in segment %d of relation %u/%u/%u",
-							segno, rlocator->spcOid, rlocator->dbOid,
-							rlocator->relNumber)));
-		pfree(payload);
 	}
+	PG_CATCH();
+	{
+		if (file >= 0)
+			FileClose(file);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (file >= 0)
+		FileClose(file);
 
 	qsort(all, total, sizeof(AppenderValDirEntry), appender_valdir_entry_cmp);
 
@@ -1010,12 +1025,14 @@ appender_valdir_search(const AppenderValDirEntry *entries, int n, Oid valueid,
 /*
  * Find a value block in one segment: the committed directory first, then a
  * scan of [scan_lo, scan_hi), the caller's own uncommitted appends that no
- * directory published yet.
+ * directory published yet.  A hit by scan leaves the segment open in
+ * *found_file for the caller's read.
  */
 static bool
 appender_find_toast_value_in_segment(const RelFileLocator *rlocator, int segno,
 									 int64 valdir_off, int64 scan_lo,
-									 int64 scan_hi, Oid valueid, int64 *off)
+									 int64 scan_hi, Oid valueid, int64 *off,
+									 File *found_file)
 {
 	AppenderBlockHeader hdr;
 	File		file;
@@ -1043,7 +1060,7 @@ appender_find_toast_value_in_segment(const RelFileLocator *rlocator, int segno,
 			hdr.first_rownum == valueid)
 		{
 			*off = p;
-			FileClose(file);
+			*found_file = file;
 			return true;
 		}
 		p += appender_block_size(&hdr);
@@ -1122,7 +1139,7 @@ appender_fetch_toast_slice(Relation toastrel, Oid valueid, int32 attrsize,
 	int			segno = -1;
 	int64		off = -1;
 	AppenderBlockHeader hdr;
-	File		file;
+	File		file = -1;
 
 	if (slicelength <= 0)
 		return;
@@ -1148,7 +1165,7 @@ appender_fetch_toast_slice(Relation toastrel, Oid valueid, int32 attrsize,
 		if (appender_find_toast_value_in_segment(&rlocator, meta[i].segno,
 												 meta[i].valdir_off,
 												 scan_lo, scan_hi,
-												 valueid, &off))
+												 valueid, &off, &file))
 			segno = meta[i].segno;
 	}
 
@@ -1170,7 +1187,7 @@ appender_fetch_toast_slice(Relation toastrel, Oid valueid, int32 attrsize,
 
 		if (appender_find_toast_value_in_segment(&rlocator, own[j].segno, 0,
 												 own[j].own_off, own[j].own_eof,
-												 valueid, &off))
+												 valueid, &off, &file))
 			segno = own[j].segno;
 	}
 
@@ -1184,7 +1201,8 @@ appender_fetch_toast_slice(Relation toastrel, Oid valueid, int32 attrsize,
 				 errmsg("external value %u is missing from \"%s\"",
 						valueid, RelationGetRelationName(toastrel))));
 
-	file = appender_seg_open(&rlocator, segno);
+	if (file < 0)
+		file = appender_seg_open(&rlocator, segno);
 	appender_seg_read_header(file, off, &hdr);
 	if (hdr.kind != APPENDER_BLOCK_KIND_VALUE ||
 		hdr.first_rownum != valueid ||
@@ -1233,6 +1251,7 @@ appender_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot,
 
 	off = lo;
 	if (appender_fetch_cache.valid &&
+		appender_fetch_cache.generation == appender_seg_generation &&
 		RelFileLocatorEquals(appender_fetch_cache.rlocator, rel->rd_locator) &&
 		appender_fetch_cache.segno == segno &&
 		appender_fetch_cache.range_start == lo &&
@@ -1240,7 +1259,7 @@ appender_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot,
 		appender_fetch_cache.blockoff < hi)
 		off = appender_fetch_cache.blockoff;
 
-	file = appender_seg_open(&rel->rd_locator, segno);
+	file = appender_seg_open_cached(&rel->rd_locator, segno);
 	while (off < hi)
 	{
 		appender_seg_read_header(file, off, &hdr);
@@ -1256,21 +1275,18 @@ appender_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot,
 	}
 
 	if (!found)
-	{
-		FileClose(file);
 		return false;
-	}
 
 	appender_fetch_cache.rlocator = rel->rd_locator;
 	appender_fetch_cache.segno = segno;
 	appender_fetch_cache.range_start = lo;
 	appender_fetch_cache.blockoff = off;
 	appender_fetch_cache.first = hdr.first_rownum;
+	appender_fetch_cache.generation = appender_seg_generation;
 	appender_fetch_cache.valid = true;
 
 	payload = palloc(Max(hdr.datalen, 1));
 	appender_seg_read_payload(file, off, &hdr, payload);
-	FileClose(file);
 
 	for (uint32 i = hdr.first_rownum; i < rownum; i++)
 		rowoff += memtuple_get_size(appender_block_row(&hdr, payload, rowoff));
@@ -1729,11 +1745,13 @@ appender_xact_callback(XactEvent event, void *arg)
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
+			appender_seg_cache_close();
 			appender_writer_end(true);
 			appender_storage_xact_end(true);
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
+			appender_seg_cache_close();
 			appender_writer_end(false);
 			appender_storage_xact_end(false);
 			break;

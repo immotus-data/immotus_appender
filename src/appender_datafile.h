@@ -78,6 +78,9 @@ extern void appender_seg_path(const RelFileLocator *rlocator, int segno,
 							  char *path);
 extern File appender_seg_create(const RelFileLocator *rlocator, int segno);
 extern File appender_seg_open(const RelFileLocator *rlocator, int segno);
+extern File appender_seg_open_cached(const RelFileLocator *rlocator, int segno);
+extern void appender_seg_cache_close(void);
+extern uint64 appender_seg_generation;
 extern void appender_seg_write_block(File file, int64 offset,
 									 AppenderBlockHeader *hdr,
 									 const char *payload);

@@ -236,6 +236,34 @@ SELECT count(*), sum(a) FROM cl;
 RESET immotus_appender.segment_size;
 DROP TABLE cl;
 
+-- TID reads never return data of a segment file that was removed in place
+SET enable_seqscan = off;
+BEGIN;
+CREATE TABLE tc (a int, b text) USING appender;
+EXPLAIN (costs off) SELECT a, b FROM tc WHERE ctid = '(65536,1)';
+INSERT INTO tc VALUES (1, 'old') RETURNING ctid AS c1 \gset
+SELECT a, b FROM tc WHERE ctid = :'c1';
+TRUNCATE tc;
+INSERT INTO tc VALUES (2, 'new') RETURNING ctid AS c2 \gset
+SELECT :'c1' = :'c2' AS same_tid;
+SELECT a, b FROM tc WHERE ctid = :'c2';
+COMMIT;
+SELECT a, b FROM tc WHERE ctid = :'c2';
+
+BEGIN;
+CREATE TABLE tc2 (a int, b text) USING appender;
+SAVEPOINT sp;
+INSERT INTO tc2 VALUES (1, 'rolled back') RETURNING ctid AS c1 \gset
+SELECT b FROM tc2 WHERE ctid = :'c1';
+ROLLBACK TO sp;
+INSERT INTO tc2 VALUES (2, 'kept') RETURNING ctid AS c2 \gset
+SELECT :'c1' = :'c2' AS same_tid;
+SELECT b FROM tc2 WHERE ctid = :'c2';
+COMMIT;
+SELECT b FROM tc2 WHERE ctid = :'c2';
+RESET enable_seqscan;
+DROP TABLE tc, tc2;
+
 -- not supported
 CREATE INDEX ON t (a);
 CREATE UNLOGGED TABLE u (a int) USING appender;

@@ -441,6 +441,78 @@ SELECT count(*), sum(a) FROM cl;
 
 RESET immotus_appender.segment_size;
 DROP TABLE cl;
+-- TID reads never return data of a segment file that was removed in place
+SET enable_seqscan = off;
+BEGIN;
+CREATE TABLE tc (a int, b text) USING appender;
+EXPLAIN (costs off) SELECT a, b FROM tc WHERE ctid = '(65536,1)';
+              QUERY PLAN               
+---------------------------------------
+ Tid Scan on tc
+   TID Cond: (ctid = '(65536,1)'::tid)
+(2 rows)
+
+INSERT INTO tc VALUES (1, 'old') RETURNING ctid AS c1 \gset
+SELECT a, b FROM tc WHERE ctid = :'c1';
+ a |  b  
+---+-----
+ 1 | old
+(1 row)
+
+TRUNCATE tc;
+INSERT INTO tc VALUES (2, 'new') RETURNING ctid AS c2 \gset
+SELECT :'c1' = :'c2' AS same_tid;
+ same_tid 
+----------
+ t
+(1 row)
+
+SELECT a, b FROM tc WHERE ctid = :'c2';
+ a |  b  
+---+-----
+ 2 | new
+(1 row)
+
+COMMIT;
+SELECT a, b FROM tc WHERE ctid = :'c2';
+ a |  b  
+---+-----
+ 2 | new
+(1 row)
+
+BEGIN;
+CREATE TABLE tc2 (a int, b text) USING appender;
+SAVEPOINT sp;
+INSERT INTO tc2 VALUES (1, 'rolled back') RETURNING ctid AS c1 \gset
+SELECT b FROM tc2 WHERE ctid = :'c1';
+      b      
+-------------
+ rolled back
+(1 row)
+
+ROLLBACK TO sp;
+INSERT INTO tc2 VALUES (2, 'kept') RETURNING ctid AS c2 \gset
+SELECT :'c1' = :'c2' AS same_tid;
+ same_tid 
+----------
+ t
+(1 row)
+
+SELECT b FROM tc2 WHERE ctid = :'c2';
+  b   
+------
+ kept
+(1 row)
+
+COMMIT;
+SELECT b FROM tc2 WHERE ctid = :'c2';
+  b   
+------
+ kept
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE tc, tc2;
 -- not supported
 CREATE INDEX ON t (a);
 ERROR:  indexing is not supported for appender tables

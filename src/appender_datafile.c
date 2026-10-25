@@ -150,6 +150,8 @@ appender_seg_path(const RelFileLocator *rlocator, int segno, char *path)
 	snprintf(path, MAXPGPATH, "%s.dat.%d", base.str, segno);
 }
 
+static void appender_seg_cache_forget(const RelFileLocator *rlocator, int segno);
+
 static void
 appender_write_file_header(File file, int segno)
 {
@@ -178,6 +180,7 @@ appender_seg_create(const RelFileLocator *rlocator, int segno)
 	char		path[MAXPGPATH];
 	File		file;
 
+	appender_seg_cache_forget(rlocator, segno);
 	appender_seg_path(rlocator, segno, path);
 	file = PathNameOpenFile(path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (file < 0)
@@ -202,6 +205,55 @@ appender_seg_open(const RelFileLocator *rlocator, int segno)
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", path)));
 	return file;
+}
+
+/* The one segment file kept open for TID lookups, see appender_seg_open_cached. */
+static struct
+{
+	RelFileLocator rlocator;
+	int			segno;
+	File		file;
+}			appender_seg_cache = {.file = -1};
+
+/* Bumped whenever a segment file is removed or re-created in place. */
+uint64		appender_seg_generation = 0;
+
+void
+appender_seg_cache_close(void)
+{
+	if (appender_seg_cache.file >= 0)
+		FileClose(appender_seg_cache.file);
+	appender_seg_cache.file = -1;
+}
+
+/*
+ * Open a segment for a read that is likely to be repeated.  The handle is
+ * owned by the cache: callers must not close it.  It is dropped at
+ * transaction end and whenever a segment file is unlinked or re-created.
+ */
+File
+appender_seg_open_cached(const RelFileLocator *rlocator, int segno)
+{
+	if (appender_seg_cache.file >= 0 &&
+		appender_seg_cache.segno == segno &&
+		RelFileLocatorEquals(appender_seg_cache.rlocator, *rlocator))
+		return appender_seg_cache.file;
+
+	appender_seg_cache_close();
+	appender_seg_cache.file = appender_seg_open(rlocator, segno);
+	appender_seg_cache.rlocator = *rlocator;
+	appender_seg_cache.segno = segno;
+	return appender_seg_cache.file;
+}
+
+static void
+appender_seg_cache_forget(const RelFileLocator *rlocator, int segno)
+{
+	appender_seg_generation++;
+	if (appender_seg_cache.file >= 0 &&
+		appender_seg_cache.segno == segno &&
+		RelFileLocatorEquals(appender_seg_cache.rlocator, *rlocator))
+		appender_seg_cache_close();
 }
 
 /* Fill in the crc and write one block at offset. */
@@ -372,6 +424,7 @@ appender_seg_unlink(const RelFileLocator *rlocator, int segno)
 {
 	char		path[MAXPGPATH];
 
+	appender_seg_cache_forget(rlocator, segno);
 	appender_seg_path(rlocator, segno, path);
 	if (unlink(path) < 0 && errno != ENOENT)
 		ereport(WARNING,
