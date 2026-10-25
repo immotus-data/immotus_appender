@@ -32,6 +32,8 @@ step s2_truncate { TRUNCATE ct; }
 session s3
 step s3_count   { SELECT who, count(*) FROM ct GROUP BY who ORDER BY who; }
 step s3_segs    { SELECT count(*) AS segments FROM appender_meta m JOIN pg_class c ON c.relfilenode = m.relfilenode WHERE c.relname = 'ct'; }
+step s3_insert  { INSERT INTO ct VALUES (0, 's3'); }
+step s3_segrows { SELECT m.segno, m.rowcount FROM appender_meta m JOIN pg_class c ON c.relfilenode = m.relfilenode WHERE c.relname = 'ct' ORDER BY m.segno; }
 
 # two open writers, interleaved: both commit, no row is lost
 permutation s1_begin s2_begin s1_insert s2_insert s1_count s2_count s3_count s1_commit s3_count s2_commit s3_count s3_segs
@@ -45,3 +47,6 @@ permutation s1_rr s2_insert s1_insert s1_count s1_commit s3_count
 
 # TRUNCATE waits for an open writer
 permutation s1_begin s1_insert s2_truncate s1_commit s3_count
+
+# a new writer reuses the fullest OPEN segment and does not add a segment
+permutation s1_begin s2_begin s1_insert s2_insert s1_commit s2_commit s3_insert s3_segrows

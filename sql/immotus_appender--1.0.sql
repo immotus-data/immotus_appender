@@ -25,9 +25,11 @@ CREATE TABLE appender_meta
     rowcount        int8     NOT NULL,
     valdir_off      int8     NOT NULL,
     format_version  int2     NOT NULL
-);
+)
+WITH (fillfactor = 80);
 
 CREATE UNIQUE INDEX appender_meta_key ON appender_meta (spcoid, relfilenode, segno);
+CREATE INDEX appender_meta_state ON appender_meta (spcoid, relfilenode, state);
 
 CREATE FUNCTION appender_meta_guard()
 RETURNS trigger

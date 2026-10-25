@@ -23,6 +23,7 @@
 
 #define APPENDER_FILE_MAGIC			0x41505044	/* "APPD" */
 #define APPENDER_FORMAT_VERSION		1
+#define APPENDER_FORMAT_VERSION_MIN	1	/* oldest format still readable */
 
 #define APPENDER_BLOCK_KIND_DATA	1
 #define APPENDER_BLOCK_KIND_VALUE	2

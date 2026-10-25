@@ -20,6 +20,7 @@
 #include "access/tableam.h"
 #include "appender_datafile.h"
 #include "appender_metadata.h"
+#include "appender_tid.h"
 #include "catalog/index.h"
 #include "commands/extension.h"
 #include "executor/tuptable.h"
@@ -45,47 +46,86 @@
 #define Anum_appender_meta_key_relfilenode	2
 #define Anum_appender_meta_key_segno		3
 
-static Oid	appender_meta_oid = InvalidOid;
-static Oid	appender_meta_index_oid = InvalidOid;
+/* Column numbers within the appender_meta_state index. */
+#define Anum_appender_meta_st_spcoid		1
+#define Anum_appender_meta_st_relfilenode	2
+#define Anum_appender_meta_st_state			3
 
-static void
-appender_meta_lookup(void)
+typedef struct AppenderMetaOids
 {
-	Oid			extoid = get_extension_oid("immotus_appender", true);
+	Oid			meta;
+	Oid			key;			/* appender_meta_key */
+	Oid			state;			/* appender_meta_state */
+} AppenderMetaOids;
 
-	if (OidIsValid(extoid))
+static AppenderMetaOids appender_meta_cache;
+static uint64 appender_meta_gen;
+
+static inline bool
+appender_meta_oids_valid(const AppenderMetaOids *o)
+{
+	return OidIsValid(o->meta) && OidIsValid(o->key) && OidIsValid(o->state);
+}
+
+/*
+ * Callers must use the returned copy: opening a relation can process
+ * invalidations that reset the cache.
+ */
+static AppenderMetaOids
+appender_meta_oids(bool missing_ok)
+{
+	AppenderMetaOids o;
+
+	if (!appender_meta_oids_valid(&appender_meta_cache))
 	{
-		Oid			nsp = get_extension_schema(extoid);
+		uint64		gen;
 
-		appender_meta_oid = get_relname_relid("appender_meta", nsp);
-		appender_meta_index_oid = get_relname_relid("appender_meta_key", nsp);
+		/* catalog lookups can process invalidations too: retry if one came */
+		do
+		{
+			Oid			extoid;
+
+			gen = appender_meta_gen;
+			memset(&o, 0, sizeof(o));
+			extoid = get_extension_oid("immotus_appender", true);
+			if (OidIsValid(extoid))
+			{
+				Oid			nsp = get_extension_schema(extoid);
+
+				o.meta = get_relname_relid("appender_meta", nsp);
+				o.key = get_relname_relid("appender_meta_key", nsp);
+				o.state = get_relname_relid("appender_meta_state", nsp);
+			}
+		} while (gen != appender_meta_gen);
+		appender_meta_cache = o;
 	}
+
+	o = appender_meta_cache;
+	if (!appender_meta_oids_valid(&o) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("appender_meta or one of its indexes is missing"),
+				 errhint("Re-create the immotus_appender extension.")));
+	return o;
 }
 
 Oid
 appender_meta_relid(bool missing_ok)
 {
-	if (!OidIsValid(appender_meta_oid) || !OidIsValid(appender_meta_index_oid))
-		appender_meta_lookup();
+	AppenderMetaOids o = appender_meta_oids(missing_ok);
 
-	if ((!OidIsValid(appender_meta_oid) || !OidIsValid(appender_meta_index_oid)) &&
-		!missing_ok)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("appender_meta is missing"),
-				 errhint("Re-create the immotus_appender extension.")));
-
-	return appender_meta_oid;
+	return appender_meta_oids_valid(&o) ? o.meta : InvalidOid;
 }
 
 void
 appender_meta_invalidate(Oid relid)
 {
-	if (!OidIsValid(relid) || relid == appender_meta_oid ||
-		relid == appender_meta_index_oid)
+	if (!OidIsValid(relid) || relid == appender_meta_cache.meta ||
+		relid == appender_meta_cache.key ||
+		relid == appender_meta_cache.state)
 	{
-		appender_meta_oid = InvalidOid;
-		appender_meta_index_oid = InvalidOid;
+		memset(&appender_meta_cache, 0, sizeof(appender_meta_cache));
+		appender_meta_gen++;
 	}
 }
 
@@ -98,6 +138,7 @@ appender_meta_row(TupleTableSlot *slot, AppenderSegment *seg)
 	seg->eof = DatumGetInt64(slot->tts_values[Anum_appender_meta_eof - 1]);
 	seg->rowcount = DatumGetInt64(slot->tts_values[Anum_appender_meta_rowcount - 1]);
 	seg->valdir_off = DatumGetInt64(slot->tts_values[Anum_appender_meta_valdir_off - 1]);
+	seg->format_version = DatumGetInt16(slot->tts_values[Anum_appender_meta_version - 1]);
 }
 
 /* Index scan over a storage's rows, or one segment's row if segno > 0. */
@@ -126,12 +167,36 @@ appender_meta_beginscan(Relation meta, Relation index,
 	return scan;
 }
 
+/* Index scan over the OPEN rows of one storage. */
+static IndexScanDesc
+appender_meta_open_beginscan(Relation meta, Relation index,
+							 const RelFileLocator *rlocator,
+							 Snapshot snapshot, ScanKeyData *keys)
+{
+	IndexScanDesc scan;
+
+	ScanKeyInit(&keys[0], Anum_appender_meta_st_spcoid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(rlocator->spcOid));
+	ScanKeyInit(&keys[1], Anum_appender_meta_st_relfilenode,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(rlocator->relNumber));
+	ScanKeyInit(&keys[2], Anum_appender_meta_st_state,
+				BTEqualStrategyNumber, F_INT2EQ,
+				Int16GetDatum(APPENDER_SEG_OPEN));
+
+	scan = index_beginscan(meta, index, snapshot, NULL, 3, 0);
+	index_rescan(scan, keys, 3, NULL, 0);
+	return scan;
+}
+
 /* One segment's row visible under snapshot: its contents and/or its TID. */
 static bool
-appender_meta_fetch(Relation meta, const RelFileLocator *rlocator, int segno,
-					Snapshot snapshot, AppenderSegment *seg, ItemPointer tid)
+appender_meta_fetch(Relation meta, Oid keyidx, const RelFileLocator *rlocator,
+					int segno, Snapshot snapshot, AppenderSegment *seg,
+					ItemPointer tid)
 {
-	Relation	index = index_open(appender_meta_index_oid, AccessShareLock);
+	Relation	index = index_open(keyidx, AccessShareLock);
 	Snapshot	snap = RegisterSnapshot(snapshot);
 	TupleTableSlot *slot = table_slot_create(meta, NULL);
 	ScanKeyData keys[3];
@@ -208,8 +273,9 @@ int
 appender_meta_segments(const RelFileLocator *rlocator, Snapshot snapshot,
 					   AppenderSegment **segs)
 {
-	Relation	meta = table_open(appender_meta_relid(false), AccessShareLock);
-	Relation	index = index_open(appender_meta_index_oid, AccessShareLock);
+	AppenderMetaOids o = appender_meta_oids(false);
+	Relation	meta = table_open(o.meta, AccessShareLock);
+	Relation	index = index_open(o.key, AccessShareLock);
 	Snapshot	snap = RegisterSnapshot(snapshot);
 	TupleTableSlot *slot = table_slot_create(meta, NULL);
 	ScanKeyData keys[3];
@@ -239,13 +305,79 @@ appender_meta_segments(const RelFileLocator *rlocator, Snapshot snapshot,
 	return n;
 }
 
+/* OPEN segments of a storage visible under snapshot. */
+int
+appender_meta_open_segments(const RelFileLocator *rlocator, Snapshot snapshot,
+							 AppenderSegment **segs)
+{
+	AppenderMetaOids o = appender_meta_oids(false);
+	Relation	meta = table_open(o.meta, AccessShareLock);
+	Relation	index = index_open(o.state, AccessShareLock);
+	Snapshot	snap = RegisterSnapshot(snapshot);
+	TupleTableSlot *slot = table_slot_create(meta, NULL);
+	ScanKeyData keys[3];
+	IndexScanDesc scan = appender_meta_open_beginscan(meta, index, rlocator,
+													  snap, keys);
+	int			n = 0;
+	int			cap = 8;
+	AppenderSegment *out = palloc(cap * sizeof(AppenderSegment));
+
+	while (index_getnext_slot(scan, ForwardScanDirection, slot))
+	{
+		if (n == cap)
+		{
+			cap *= 2;
+			out = repalloc(out, cap * sizeof(AppenderSegment));
+		}
+		appender_meta_row(slot, &out[n++]);
+	}
+
+	index_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	UnregisterSnapshot(snap);
+	index_close(index, AccessShareLock);
+	table_close(meta, AccessShareLock);
+
+	*segs = out;
+	return n;
+}
+
+/* Highest segno visible under snapshot, APPENDER_FIRST_SEGNO - 1 if none. */
+int
+appender_meta_max_segno(const RelFileLocator *rlocator, Snapshot snapshot)
+{
+	AppenderMetaOids o = appender_meta_oids(false);
+	Relation	meta = table_open(o.meta, AccessShareLock);
+	Relation	index = index_open(o.key, AccessShareLock);
+	Snapshot	snap = RegisterSnapshot(snapshot);
+	TupleTableSlot *slot = table_slot_create(meta, NULL);
+	ScanKeyData keys[3];
+	IndexScanDesc scan = appender_meta_beginscan(meta, index, rlocator, 0,
+												 snap, keys);
+	int			maxsegno = APPENDER_FIRST_SEGNO - 1;
+
+	if (index_getnext_slot(scan, BackwardScanDirection, slot))
+	{
+		slot_getallattrs(slot);
+		maxsegno = DatumGetInt32(slot->tts_values[Anum_appender_meta_segno - 1]);
+	}
+
+	index_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	UnregisterSnapshot(snap);
+	index_close(index, AccessShareLock);
+	table_close(meta, AccessShareLock);
+	return maxsegno;
+}
+
 bool
 appender_meta_get(const RelFileLocator *rlocator, int segno, Snapshot snapshot,
 				  AppenderSegment *seg)
 {
-	Relation	meta = table_open(appender_meta_relid(false), AccessShareLock);
-	bool		found = appender_meta_fetch(meta, rlocator, segno, snapshot,
-										seg, NULL);
+	AppenderMetaOids o = appender_meta_oids(false);
+	Relation	meta = table_open(o.meta, AccessShareLock);
+	bool		found = appender_meta_fetch(meta, o.key, rlocator, segno,
+										snapshot, seg, NULL);
 
 	table_close(meta, AccessShareLock);
 	return found;
@@ -259,9 +391,10 @@ appender_meta_get(const RelFileLocator *rlocator, int segno, Snapshot snapshot,
 void
 appender_meta_store(const RelFileLocator *rlocator, const AppenderSegment *seg)
 {
-	Relation	meta = table_open(appender_meta_relid(false), RowExclusiveLock);
+	AppenderMetaOids o = appender_meta_oids(false);
+	Relation	meta = table_open(o.meta, RowExclusiveLock);
 	ItemPointerData oldtid;
-	bool		found = appender_meta_fetch(meta, rlocator, seg->segno,
+	bool		found = appender_meta_fetch(meta, o.key, rlocator, seg->segno,
 										GetLatestSnapshot(), NULL, &oldtid);
 	Datum		values[Natts_appender_meta];
 	bool		nulls[Natts_appender_meta] = {0};
@@ -292,7 +425,7 @@ appender_meta_store(const RelFileLocator *rlocator, const AppenderSegment *seg)
 void
 appender_meta_delete(const RelFileLocator *rlocator)
 {
-	Oid			metaid = appender_meta_relid(true);
+	AppenderMetaOids o = appender_meta_oids(true);
 	Relation	meta;
 	Relation	index;
 	Snapshot	snap;
@@ -302,13 +435,13 @@ appender_meta_delete(const RelFileLocator *rlocator)
 	List	   *tids = NIL;
 	ListCell   *lc;
 
-	if (!OidIsValid(metaid) ||
-		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(metaid)) ||
-		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(appender_meta_index_oid)))
+	if (!appender_meta_oids_valid(&o) ||
+		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(o.meta)) ||
+		!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(o.key)))
 		return;
 
-	meta = table_open(metaid, RowExclusiveLock);
-	index = index_open(appender_meta_index_oid, AccessShareLock);
+	meta = table_open(o.meta, RowExclusiveLock);
+	index = index_open(o.key, AccessShareLock);
 	snap = RegisterSnapshot(GetLatestSnapshot());
 	slot = table_slot_create(meta, NULL);
 	scan = appender_meta_beginscan(meta, index, rlocator, 0, snap, keys);

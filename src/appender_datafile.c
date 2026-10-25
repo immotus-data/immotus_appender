@@ -233,7 +233,8 @@ appender_seg_read_header(File file, int64 offset, AppenderBlockHeader *hdr)
 				 errmsg("could not read block header at offset %lld of file \"%s\": %m",
 						(long long) offset, FilePathName(file))));
 
-	if (hdr->version != APPENDER_FORMAT_VERSION ||
+	if (hdr->version < APPENDER_FORMAT_VERSION_MIN ||
+		hdr->version > APPENDER_FORMAT_VERSION ||
 		(hdr->kind != APPENDER_BLOCK_KIND_DATA &&
 		 hdr->kind != APPENDER_BLOCK_KIND_VALUE &&
 		 hdr->kind != APPENDER_BLOCK_KIND_VALDIR) ||

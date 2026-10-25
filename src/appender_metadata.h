@@ -26,12 +26,17 @@ typedef struct AppenderSegment
 	int64		eof;			/* committed logical end of the segment file */
 	int64		rowcount;		/* committed rows in the segment */
 	int64		valdir_off;		/* committed offset of the value directory */
+	int16		format_version;	/* format of the blocks written to it */
 } AppenderSegment;
 
 extern Oid	appender_meta_relid(bool missing_ok);
 extern void appender_meta_invalidate(Oid relid);
 extern int	appender_meta_segments(const RelFileLocator *rlocator,
 								   Snapshot snapshot, AppenderSegment **segs);
+extern int	appender_meta_open_segments(const RelFileLocator *rlocator,
+									 Snapshot snapshot, AppenderSegment **segs);
+extern int	appender_meta_max_segno(const RelFileLocator *rlocator,
+							 Snapshot snapshot);
 extern bool appender_meta_get(const RelFileLocator *rlocator, int segno,
 							  Snapshot snapshot, AppenderSegment *seg);
 extern void appender_meta_store(const RelFileLocator *rlocator,

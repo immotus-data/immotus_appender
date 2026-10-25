@@ -207,6 +207,35 @@ SELECT count(*) FROM appender_meta WHERE relfilenode = :d_node;
 DELETE FROM appender_meta;
 TRUNCATE appender_meta;
 
+-- claiming: a writer reuses the OPEN segment instead of starting a new one
+SET immotus_appender.segment_size = '1MB';
+CREATE TABLE cl (a int, b text) USING appender;
+INSERT INTO cl SELECT g, repeat('x', 100) FROM generate_series(1, 30000) g;
+SELECT count(*) FILTER (WHERE state = 1) > 1 AS sealed_many,
+       count(*) FILTER (WHERE state = 0) AS open
+  FROM segs('cl');
+SELECT count(*) AS nsegs, max(segno) AS maxsegno FROM segs('cl') \gset
+SELECT segno AS open_seg, rowcount AS open_rows FROM segs('cl') WHERE state = 0 \gset
+INSERT INTO cl VALUES (0, 'next');
+SELECT count(*) = :nsegs AS no_new_segment FROM segs('cl');
+SELECT rowcount = :open_rows + 1 AS row_in_open FROM segs('cl') WHERE segno = :open_seg;
+
+-- a segment of another format version is never appended to: the next free
+-- number (max + 1) is used instead and the old segment stays OPEN
+SELECT relfilenode AS cl_node FROM pg_class WHERE relname = 'cl' \gset
+ALTER TABLE appender_meta DISABLE TRIGGER appender_meta_guard_trigger;
+UPDATE appender_meta SET format_version = 99
+ WHERE relfilenode = :cl_node AND segno = :open_seg;
+INSERT INTO cl VALUES (0, 'newer');
+SELECT segno = :maxsegno + 1 AS next_number, state FROM segs('cl') WHERE segno > :maxsegno;
+SELECT state, rowcount = :open_rows + 1 AS untouched FROM segs('cl') WHERE segno = :open_seg;
+UPDATE appender_meta SET format_version = 1
+ WHERE relfilenode = :cl_node AND segno = :open_seg;
+ALTER TABLE appender_meta ENABLE TRIGGER appender_meta_guard_trigger;
+SELECT count(*), sum(a) FROM cl;
+RESET immotus_appender.segment_size;
+DROP TABLE cl;
+
 -- not supported
 CREATE INDEX ON t (a);
 CREATE UNLOGGED TABLE u (a int) USING appender;
@@ -224,5 +253,11 @@ CREATE DATABASE appender_copy TEMPLATE :"db";
 
 DROP TABLE t, h, s, s2, al, st, sg, big, pt;
 SELECT appender_gc();
+
+-- both manifest indexes are intact after inserts, TRUNCATE and DROP
+CREATE EXTENSION amcheck;
+SELECT bt_index_check('appender_meta_key'), bt_index_check('appender_meta_state');
+DROP EXTENSION amcheck;
+
 DROP FUNCTION segs(regclass);
 DROP EXTENSION immotus_appender;

@@ -229,6 +229,24 @@ appender_writer_has_seg(AppenderWriter *w, int segno)
 	return false;
 }
 
+/* Prefer fuller OPEN segments first to reduce the number of active writers. */
+static int
+appender_openseg_cmp(const void *a, const void *b)
+{
+	const AppenderSegment *sa = (const AppenderSegment *) a;
+	const AppenderSegment *sb = (const AppenderSegment *) b;
+
+	if (sa->eof > sb->eof)
+		return -1;
+	if (sa->eof < sb->eof)
+		return 1;
+	if (sa->rowcount > sb->rowcount)
+		return -1;
+	if (sa->rowcount < sb->rowcount)
+		return 1;
+	return pg_cmp_s32(sa->segno, sb->segno);
+}
+
 static AppenderWSeg *
 appender_add_seg(AppenderWriter *w, int segno, bool is_new, int64 eof,
 				 uint32 rows, int64 valdir_off)
@@ -261,28 +279,33 @@ static void appender_flush_valdir(AppenderWriter *w, AppenderWSeg *seg);
 static void
 appender_claim_segment(AppenderWriter *w)
 {
-	AppenderSegment *segs;
-	int			nsegs = appender_meta_segments(&w->rlocator, GetLatestSnapshot(),
-											   &segs);
-	int			maxsegno = APPENDER_FIRST_SEGNO - 1;
+	AppenderSegment *open_segs;
+	int			nopen = appender_meta_open_segments(&w->rlocator,
+										   GetLatestSnapshot(),
+										   &open_segs);
+	int			maxsegno = appender_meta_max_segno(&w->rlocator,
+										   GetLatestSnapshot());
 	AppenderSegment cur;
 
-	for (int i = 0; i < nsegs; i++)
-		maxsegno = Max(maxsegno, segs[i].segno);
 	for (int i = 0; i < w->nsegs; i++)
 		maxsegno = Max(maxsegno, w->segs[i].segno);
 
-	for (int i = 0; i < nsegs; i++)
-	{
-		int			segno = segs[i].segno;
+	if (nopen > 1)
+		qsort(open_segs, nopen, sizeof(AppenderSegment), appender_openseg_cmp);
 
-		if (segs[i].state != APPENDER_SEG_OPEN ||
+	for (int i = 0; i < nopen; i++)
+	{
+		int			segno = open_segs[i].segno;
+
+		/* never append to a segment written in another format version */
+		if (open_segs[i].format_version != APPENDER_FORMAT_VERSION ||
 			appender_writer_has_seg(w, segno) ||
 			!appender_seg_trylock(&w->rlocator, segno))
 			continue;
 
 		if (appender_meta_get(&w->rlocator, segno, GetLatestSnapshot(), &cur) &&
-			cur.state == APPENDER_SEG_OPEN)
+			cur.state == APPENDER_SEG_OPEN &&
+			cur.format_version == APPENDER_FORMAT_VERSION)
 		{
 			AppenderWSeg *seg = appender_add_seg(w, segno, false, cur.eof,
 												 (uint32) cur.rowcount,
@@ -290,7 +313,7 @@ appender_claim_segment(AppenderWriter *w)
 
 			if (!appender_seg_full(seg))
 			{
-				pfree(segs);
+				pfree(open_segs);
 				return;
 			}
 			/* left full by its last writer: seal it on our way past */
@@ -299,7 +322,7 @@ appender_claim_segment(AppenderWriter *w)
 		}
 		appender_seg_unlock(&w->rlocator, segno);
 	}
-	pfree(segs);
+	pfree(open_segs);
 
 	for (int segno = maxsegno + 1;; segno++)
 	{
@@ -313,7 +336,8 @@ appender_claim_segment(AppenderWriter *w)
 
 		if (appender_meta_get(&w->rlocator, segno, GetLatestSnapshot(), &cur))
 		{
-			if (cur.state == APPENDER_SEG_OPEN)
+			if (cur.state == APPENDER_SEG_OPEN &&
+				cur.format_version == APPENDER_FORMAT_VERSION)
 			{
 				AppenderWSeg *seg = appender_add_seg(w, segno, false, cur.eof,
 													 (uint32) cur.rowcount,
