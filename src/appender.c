@@ -1833,7 +1833,7 @@ _PG_init(void)
 							NULL,
 							&appender_segment_size_mb,
 							1024, 1, 1024 * 1024,
-							PGC_USERSET, GUC_UNIT_MB,
+							PGC_SUSET, GUC_UNIT_MB,
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("immotus_appender.prealloc_chunk",
 							"Chunk of a segment preallocated (zero-filled) at once.",
