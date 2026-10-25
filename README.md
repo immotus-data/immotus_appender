@@ -31,23 +31,28 @@ is sealed once it reaches `immotus_appender.segment_size` and is immutable from
 then on. Every block carries a checksum. A row's TID is logical:
 (segment, row number), independent of where the row is stored.
 
-Large varlena values are stored in dedicated value blocks and referenced by
-standard TOAST pointers. Sealed segments use a value directory (VALDIR) so
-value lookups are indexed instead of scanned; the per-backend cache for this
-directory is bounded by `immotus_appender.valdir_cache_size`.
+Large varlena values are stored in dedicated value blocks in the same segment
+and referenced by standard TOAST pointers, so there is no separate TOAST table.
+Each segment carries a value directory, so a value is found by lookup rather
+than by scanning; the per-backend cache of directories is bounded by
+`immotus_appender.valdir_cache_size`.
 
 The `appender_meta` table (in the extension's schema) is the manifest: one row
 per segment with its committed end. A transaction's appends become visible
 when its manifest update commits, so appends are atomic and MVCC-correct.
-Concurrent writers append to different segments. Direct DML on the manifest is
-blocked by a trigger.
+Concurrent writers append to different segments: a writer takes an open
+segment no other transaction holds, the fullest first, or else starts a new
+one, so the number of open segments stays at the peak number of concurrent
+writers. Direct DML on the manifest is blocked by a trigger.
 
 Every change to segment files is WAL-logged by a custom resource manager, so
 streaming replication, point-in-time recovery, incremental backups and
-`pg_rewind` work. Touched segments are flushed with `fdatasync` at commit,
-before the manifest update: a commit therefore costs one more sync than on
-heap, which hurts single-row transactions most and shrinks as commits get
-larger (see Commit cost).
+`pg_rewind` work. Incremental backups copy segment files in full, because
+PostgreSQL tracks changed blocks only for its own relation files.
+
+Touched segments are flushed with `fdatasync` at commit, before the manifest
+update: a commit therefore costs one more sync than on heap, which hurts
+single-row transactions most and less as commits get larger (see Commit cost).
 Segment files are zero-filled ahead in `immotus_appender.prealloc_chunk`
 (default 1 MB, 0 disables) chunks, so the `fdatasync` of a commit that stays
 inside a chunk does not pay for the file-size change. The physical file can be
@@ -62,7 +67,10 @@ parallel scans, savepoints, `TRUNCATE`, `ALTER TABLE` (including rewrites and
 
 Not supported: `UPDATE`, `DELETE`, `INSERT ... ON CONFLICT`, indexes, backward
 scans, `TABLESAMPLE`, unlogged and temporary tables, two-phase commit,
-`CLUSTER`/`VACUUM FULL`, moving a table to another tablespace.
+`CLUSTER`/`VACUUM FULL`, moving a table to another tablespace, logical
+replication and logical decoding. A publication accepts an appender table, but
+its rows are never sent: do not use logical replication or CDC tools with
+appender tables.
 `CREATE DATABASE` from a template that contains appender tables requires
 `STRATEGY = FILE_COPY`. Major-version upgrades use `pg_upgrade` plus a copy of
 the segment files; see `doc/pg_upgrade.md`.
@@ -78,51 +86,67 @@ Do not use in production.
 
 ## Performance
 
-PostgreSQL 18.6 release build (`-O3`, no assertions), `shared_buffers = 1GB`,
-Apple M-series laptop, medians of 3 runs. Rows of 4 columns with a 64-byte
-payload.
+Measured against heap on Linux (ext4) with PostgreSQL 18 from the PGDG
+packages, `fsync = on`, `shared_buffers = 1GB` and default `immotus_appender`
+settings; reads run with a warm cache. Rows have 4 columns with a 64-byte
+payload. Each figure is the median of 5 runs. Absolute throughput depends on
+hardware, so it is shown relative to heap; bytes per row do not. To reproduce
+on your own hardware, run `bench/run.sh`.
+
+Storage, 1M rows:
 
 | | heap | appender |
 | --- | --- | --- |
-| bulk load, rows/s (`INSERT ... SELECT` 1M rows) | 707,884 | **1,019,649** |
-| WAL, bytes/row | 136.4 | **96.6** |
-| size on disk, bytes/row | 117.0 | **96.1** |
-| `count(*)` over 1M rows, single process, ms | **34.8** | 38.4 |
-| `count(*)` over 1M rows, 2 workers, ms | **15.5** | 16.4 |
-| 1 row per commit, 4 clients, commits/s | **60,053** | 31,250 |
-| 100 rows per commit, 4 clients, rows/s | **432,900** | 234,000 |
+| WAL, bytes/row, `INSERT ... SELECT` | 136.4 | **96.5** |
+| WAL, bytes/row, `COPY` | **91.2** | 96.5 |
+| size on disk, bytes/row | 117.0 | **96.4** |
 
-Bulk loads are faster and smaller. Scans are close to heap: rows are deformed
-only up to the columns a query needs, and block checksums are computed in
-three interleaved streams; what remains is copying from the OS page cache.
-Short transactions pay for the extra fsync at commit.
+Speed, appender relative to heap (above 1 means appender is faster):
+
+| workload | appender / heap |
+| --- | --- |
+| bulk load, `INSERT ... SELECT` 1M rows | **1.43** |
+| bulk load, `COPY` 1M rows | 0.81 |
+| `count(*)` over 1M rows, 1 process | 0.76 |
+| `count(*)` over 1M rows, 2 workers | 0.67 |
+| aggregate over all 4 columns, 1M rows, 1 process | 0.93 |
+| write 100 KB values (`EXTERNAL`) | 0.93 |
+| read 100 KB values | 0.77 |
+
+Bulk loads through `INSERT ... SELECT` are faster than heap and produce less
+WAL. `COPY` is slower than heap: it does not batch rows yet, while heap writes
+multi-row WAL records. Scans read through the OS page cache instead of
+shared buffers and verify a checksum for every block, so they trail heap the
+most on narrow queries such as `count(*)`; the more columns a query
+deforms, the closer they get.
+
+Row-level `AFTER` triggers and foreign keys on an appender table re-read every
+new row by TID, which is much more expensive than on heap: loading 200,000
+rows into a table with a foreign key ran at about a quarter of heap's speed.
 
 ### Commit cost
 
 Every commit that appended rows `fdatasync`s the touched segments before the
-manifest update, on top of the WAL flush heap needs. Medians of 3 runs of 10 s,
-release build (`-O3`, no assertions), Apple M2, `fsync = on`,
-`synchronous_commit = on`, `wal_sync_method = open_datasync`,
-`shared_buffers = 1GB`, default `immotus_appender` settings, same 4-column row
-as above. Run-to-run spread is large at 100 rows per commit (heap, 1 client:
-2.4k to 10.1k commits/s), so read the ratios, not the digits.
+manifest update, on top of the WAL flush heap needs. Same setup as above,
+`synchronous_commit = on`, 15-second `pgbench` runs:
 
-| clients | rows per commit | heap commits/s | appender commits/s | appender / heap |
-| --- | --- | --- | --- | --- |
-| 1 | 1 | **26,522** | 11,620 | 0.44 |
-| 1 | 100 | **2,682** | 1,684 | 0.63 |
-| 8 | 1 | **69,362** | 28,955 | 0.42 |
-| 8 | 100 | **6,109** | 4,127 | 0.68 |
+| clients | rows per commit | appender / heap |
+| --- | --- | --- |
+| 1 | 1 | 0.56 |
+| 1 | 100 | 0.66 |
+| 8 | 1 | 0.41 |
+| 8 | 100 | 0.49 |
 
-With `fsync = on` heap was faster in every case measured: appender gives up
-commit rate for smaller rows and WAL. The gap narrows as commits get larger.
+Heap commits faster in every case: appender trades commit rate for smaller
+rows and less WAL. With more clients heap gains from group commit of the WAL
+flush, while each appender commit still syncs its own segment.
 
 - `synchronous_commit = off` does not remove the segment `fdatasync`: a commit
   record could reach disk without its data, and local crash recovery does not
   replay segment data.
 - A standby repeats the sync for every commit it replays.
-- Batch at least 100 rows per commit or use `COPY`. Idle-in-transaction
-  writers each hold a segment, so keep write transactions short.
+- Commit many rows at a time. Idle-in-transaction writers each hold a
+  segment, so keep write transactions short.
 - There is no `DELETE`. Retain data with time partitions and drop or detach
   old ones.
 - A table storage can use at most 65,534 segment numbers over its lifetime:
@@ -154,8 +178,7 @@ CREATE TABLE audit_log (
     id          bigint GENERATED ALWAYS AS IDENTITY,
     event_time  timestamptz NOT NULL DEFAULT now(),
     user_id     uuid NOT NULL,
-    action      text NOT NULL,; it needs the `amcheck` contrib
-  module
+    action      text NOT NULL,
     payload     jsonb
 ) USING appender;
 
@@ -184,7 +207,7 @@ make installcheck PG_CONFIG=/path/to/pg_config
 
 `make installcheck` runs, against a running server:
 
-- the SQL regression test (`sql/appender.sql`);
+- the SQL regression tests (`sql/`; they need the `amcheck` contrib module);
 - the isolation test of concurrent writers and readers (`specs/`);
 - the TAP tests (`t/`): crash recovery, streaming replication and promotion,
   point-in-time recovery, incremental backup and `pg_rewind`.
