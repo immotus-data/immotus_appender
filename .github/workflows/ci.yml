@@ -24,7 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.PG_PREFIX }}
-          key: pg-${{ env.PG_VERSION }}-tap-v1
+          key: pg-${{ env.PG_VERSION }}-tap-amcheck-v2
 
       - name: Build PostgreSQL
         if: steps.cache-pg.outputs.cache-hit != 'true'
@@ -36,6 +36,7 @@ jobs:
             --enable-cassert --enable-debug
           make -j"$(nproc)" install
           make -C src/test/isolation install
+          make -C contrib/amcheck install
 
       - name: Build and install the extension
         run: |
