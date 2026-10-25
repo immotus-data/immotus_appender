@@ -46,7 +46,8 @@ Every change to segment files is WAL-logged by a custom resource manager, so
 streaming replication, point-in-time recovery, incremental backups and
 `pg_rewind` work. Touched segments are flushed with `fdatasync` at commit,
 before the manifest update: a commit therefore costs one more sync than on
-heap, which matters for single-row transactions and not for batched inserts.
+heap, which hurts single-row transactions most and shrinks as commits get
+larger (see Commit cost).
 Segment files are zero-filled ahead in `immotus_appender.prealloc_chunk`
 (default 1 MB, 0 disables) chunks, so the `fdatasync` of a commit that stays
 inside a chunk does not pay for the file-size change. The physical file can be
@@ -96,6 +97,40 @@ only up to the columns a query needs, and block checksums are computed in
 three interleaved streams; what remains is copying from the OS page cache.
 Short transactions pay for the extra fsync at commit.
 
+### Commit cost
+
+Every commit that appended rows `fdatasync`s the touched segments before the
+manifest update, on top of the WAL flush heap needs. Medians of 3 runs of 10 s,
+release build (`-O3`, no assertions), Apple M2, `fsync = on`,
+`synchronous_commit = on`, `wal_sync_method = open_datasync`,
+`shared_buffers = 1GB`, default `immotus_appender` settings, same 4-column row
+as above. Run-to-run spread is large at 100 rows per commit (heap, 1 client:
+2.4k to 10.1k commits/s), so read the ratios, not the digits.
+
+| clients | rows per commit | heap commits/s | appender commits/s | appender / heap |
+| --- | --- | --- | --- | --- |
+| 1 | 1 | **26,522** | 11,620 | 0.44 |
+| 1 | 100 | **2,682** | 1,684 | 0.63 |
+| 8 | 1 | **69,362** | 28,955 | 0.42 |
+| 8 | 100 | **6,109** | 4,127 | 0.68 |
+
+With `fsync = on` heap was faster in every case measured: appender gives up
+commit rate for smaller rows and WAL. The gap narrows as commits get larger.
+
+- `synchronous_commit = off` does not remove the segment `fdatasync`: a commit
+  record could reach disk without its data, and local crash recovery does not
+  replay segment data.
+- A standby repeats the sync for every commit it replays.
+- Batch at least 100 rows per commit or use `COPY`. Idle-in-transaction
+  writers each hold a segment, so keep write transactions short.
+- There is no `DELETE`. Retain data with time partitions and drop or detach
+  old ones.
+- A table storage can use at most 65,534 segment numbers over its lifetime:
+  sealed segments keep their number until `TRUNCATE` or a rewrite. That is
+  about 64 TB at the default 1 GB segment size, but a tiny
+  `immotus_appender.segment_size` reaches it quickly, which is why only
+  superusers can change it.
+
 ## Quick start
 
 ```bash
@@ -119,7 +154,8 @@ CREATE TABLE audit_log (
     id          bigint GENERATED ALWAYS AS IDENTITY,
     event_time  timestamptz NOT NULL DEFAULT now(),
     user_id     uuid NOT NULL,
-    action      text NOT NULL,
+    action      text NOT NULL,; it needs the `amcheck` contrib
+  module
     payload     jsonb
 ) USING appender;
 
