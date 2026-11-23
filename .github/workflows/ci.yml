@@ -1,7 +1,11 @@
 name: CI
 
+# A pull request runs the suite once, on the pull_request event; a push only
+# verifies the default branch after a merge, so pushing a branch does not
+# start a second, identical run.
 on:
   push:
+    branches: [master]
   pull_request:
   # The release pipeline runs the same suite against a tag, in a release
   # build rather than the default assertion-enabled one.
@@ -12,6 +16,11 @@ on:
         type: string
         required: false
         default: debug
+
+# A newer commit on the same branch makes the previous run irrelevant.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
 
 jobs:
   test:
