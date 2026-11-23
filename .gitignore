@@ -1,0 +1,12 @@
+*.o
+*.so
+*.bc
+*.dylib
+results/
+output_iso/
+.deps/
+tmp_check/
+regression.out
+regression.diffs
+Makefile.global
+.clangd

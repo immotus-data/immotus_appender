@@ -1,0 +1,13 @@
+immotus_appender is dual-licensed under the PostgreSQL License and the
+Apache License 2.0.  You may choose either license to govern your use of
+this work.
+
+  1. PostgreSQL License  ->  LICENSE-POSTGRESQL.txt
+  2. Apache License 2.0  ->  LICENSE-APACHE.txt
+
+SPDX-License-Identifier: PostgreSQL OR Apache-2.0
+
+All contributions to immotus_appender are made under both licenses.
+
+Third-party attributions are listed in NOTICE.  The Greenplum/VMware-derived
+MemTuple code remains subject to the Apache License 2.0.

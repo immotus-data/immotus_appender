@@ -1,0 +1,1863 @@
+/*-------------------------------------------------------------------------
+ *
+ * appender.c
+ *    The appender table access method.
+ *
+ * Rows are only ever appended.  They live in segment files outside the
+ * buffer manager (appender_datafile.c), their visibility is defined by the
+ * segment manifest (appender_metadata.c) together with this backend's own
+ * uncommitted appends (appender_writer.c), and every change to segment files
+ * is WAL-logged by a custom resource manager (appender_xlog.c).
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/multixact.h"
+#include "access/relation.h"
+#include "access/relscan.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "access/xact.h"
+#include "access/xlog_internal.h"
+#include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_publication.h"
+#include "catalog/storage.h"
+#include "commands/defrem.h"
+#include "commands/vacuum.h"
+#include "executor/tuptable.h"
+#include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "pgstat.h"
+#include "port/atomics.h"
+#include "storage/predicate.h"
+#include "storage/procarray.h"
+#include "storage/read_stream.h"
+#include "storage/smgr.h"
+#include "tcop/utility.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"
+#include "utils/inval.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/syscache.h"
+#include "utils/timestamp.h"
+
+#include "appender_compat.h"
+#include "appender_datafile.h"
+#include "appender_lifecycle.h"
+#include "appender_memtuple.h"
+#include "appender_metadata.h"
+#include "appender_tid.h"
+#include "appender_valdir.h"
+#include "appender_writer.h"
+#include "appender_xlog.h"
+
+PG_MODULE_MAGIC;
+
+static const RmgrData appender_rmgr = {
+	.rm_name = "appender",
+	.rm_redo = appender_redo,
+	.rm_desc = appender_desc,
+	.rm_identify = appender_identify,
+};
+
+static object_access_hook_type prev_object_access_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+/*
+ * Virtual slots that deform a stored row lazily, on the first access to its
+ * attributes.  Heap-tuple copies keep the TID: ANALYZE sorts its sample by
+ * t_self.  Filled in from TTSOpsVirtual at load time.
+ */
+static TupleTableSlotOps appender_slot_ops;
+
+typedef struct AppenderTupleTableSlot
+{
+	VirtualTupleTableSlot base;
+	MemTuple	mtup;			/* row not deformed yet, NULL if virtual */
+	MemTupleBinding *bind;
+	int			mtup_natts;		/* attributes stored in mtup */
+} AppenderTupleTableSlot;
+
+static void
+appender_slot_clear(TupleTableSlot *slot)
+{
+	((AppenderTupleTableSlot *) slot)->mtup = NULL;
+	TTSOpsVirtual.clear(slot);
+}
+
+/*
+ * Rows carry only the attributes the table had when they were written, so a
+ * request beyond that ends in the table's defaults and nulls.  Up to 18 the
+ * executor filled those in itself; 19 made it the method's job.
+ */
+static void
+appender_slot_getsomeattrs(TupleTableSlot *slot, int natts)
+{
+	AppenderTupleTableSlot *aslot = (AppenderTupleTableSlot *) slot;
+	int			upto = Min(natts, aslot->mtup_natts);
+
+	Assert(aslot->mtup != NULL);
+	if (slot->tts_nvalid < upto)
+	{
+		memtuple_deform_range(aslot->mtup, aslot->bind, slot->tts_nvalid, upto,
+							  slot->tts_values, slot->tts_isnull);
+		slot->tts_nvalid = upto;
+	}
+
+	if (slot->tts_nvalid < natts)
+	{
+		slot_getmissingattrs(slot, slot->tts_nvalid, natts);
+		slot->tts_nvalid = natts;
+	}
+}
+
+static void
+appender_slot_materialize(TupleTableSlot *slot)
+{
+	AppenderTupleTableSlot *aslot = (AppenderTupleTableSlot *) slot;
+
+	if (aslot->mtup)
+	{
+		slot_getallattrs(slot);
+		aslot->mtup = NULL;
+	}
+	TTSOpsVirtual.materialize(slot);
+}
+
+static void
+appender_slot_copyslot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
+{
+	((AppenderTupleTableSlot *) dstslot)->mtup = NULL;
+	TTSOpsVirtual.copyslot(dstslot, srcslot);
+}
+
+static HeapTuple
+appender_slot_copy_heap_tuple(TupleTableSlot *slot)
+{
+	HeapTuple	tup;
+
+	slot_getallattrs(slot);
+	tup = TTSOpsVirtual.copy_heap_tuple(slot);
+	tup->t_self = slot->tts_tid;
+	tup->t_tableOid = slot->tts_tableOid;
+	return tup;
+}
+
+static MinimalTuple
+appender_slot_copy_minimal_tuple(APPENDER_COPY_MINIMAL_TUPLE_ARGS)
+{
+	slot_getallattrs(slot);
+	return TTSOpsVirtual.copy_minimal_tuple(slot APPENDER_COPY_MINIMAL_TUPLE_EXTRA);
+}
+
+/* Store a row to be deformed on demand; mtup and bind must outlive it. */
+static void
+appender_slot_store(TupleTableSlot *slot, MemTuple mtup, MemTupleBinding *bind,
+					int natts)
+{
+	AppenderTupleTableSlot *aslot = (AppenderTupleTableSlot *) slot;
+
+	ExecClearTuple(slot);
+	aslot->mtup = mtup;
+	aslot->bind = bind;
+	aslot->mtup_natts = natts;
+	slot->tts_flags &= ~TTS_FLAG_EMPTY;
+}
+
+/* ----------------------------------------------------------------------------
+ * Scans
+ * -------------------------------------------------------------------------
+ */
+
+typedef struct AppenderParallelScanData
+{
+	ParallelTableScanDescData base;
+	pg_atomic_uint64 cursor;	/* next unclaimed block, see APPENDER_CURSOR */
+	int32		nown;			/* leader's own appends */
+	AppenderScanSeg own[FLEXIBLE_ARRAY_MEMBER];
+} AppenderParallelScanData;
+
+/* Block position shared by parallel workers: segment index, range, offset. */
+#define APPENDER_CURSOR(seg, range, off) \
+	(((uint64) (seg) << 48) | ((uint64) (range) << 47) | (uint64) (off))
+#define APPENDER_CURSOR_SEG(c)		((int) ((c) >> 48))
+#define APPENDER_CURSOR_RANGE(c)	((int) (((c) >> 47) & 1))
+#define APPENDER_CURSOR_OFF(c)		((int64) ((c) & ((UINT64CONST(1) << 47) - 1)))
+
+typedef struct AppenderScanDescData
+{
+	TableScanDescData rs_base;
+	MemoryContext mcxt;
+	AppenderScanSeg *segs;
+	int			nsegs;
+	int			cur;			/* segment index, -1 before the first */
+	int			range;			/* 0: committed rows, 1: own rows */
+	int64		off;			/* next block to read */
+	int64		range_start;
+	int64		range_end;
+	int64		vbase;			/* position of range_start across all ranges */
+	File		file;
+	int			file_segno;
+	AppenderBlockHeader hdr;
+	char	   *block;
+	Size		blockcap;
+	bool		loaded;
+	uint32		row;			/* next row of the loaded block */
+	uint32		rowoff;
+	MemTupleBinding *bind;		/* layout of bind_natts attributes of
+								 * bind_desc */
+	TupleDesc	bind_desc;
+	int			bind_natts;
+	int64		an_hi;			/* ANALYZE: end of the sampled range */
+} AppenderScanDescData;
+
+typedef AppenderScanDescData *AppenderScanDesc;
+
+static inline CommandId
+appender_snapshot_cid(Snapshot snapshot)
+{
+	return IsMVCCSnapshot(snapshot) ? snapshot->curcid : InvalidCommandId;
+}
+
+static inline Snapshot
+appender_meta_snapshot(Snapshot snapshot)
+{
+	return IsMVCCSnapshot(snapshot) ? snapshot : GetLatestSnapshot();
+}
+
+static inline CommandId
+appender_active_cid(void)
+{
+	return ActiveSnapshotSet() ? GetActiveSnapshot()->curcid : InvalidCommandId;
+}
+
+/*
+ * Collect the segments a reader may see: the committed manifest rows visible
+ * to 'snapshot', merged with this backend's own appends.  'flush' publishes
+ * the writer's buffered rows first; 'own_cid' picks the command boundary for
+ * own-row visibility.  The merged list is palloc'd in the caller's context.
+ */
+static void
+appender_collect_segments(Relation rel, Snapshot snapshot, bool flush,
+						  CommandId own_cid, AppenderScanSeg **segs, int *nsegs)
+{
+	AppenderScanSeg *own;
+	int			nown;
+
+	if (flush)
+		appender_writer_flush(&rel->rd_locator);
+
+	nown = appender_own_segments(&rel->rd_locator, own_cid, &own);
+	*nsegs = appender_visible_segments(&rel->rd_locator, snapshot, own, nown,
+									   segs);
+	/* appender_own_segments returns NULL when there is nothing of our own */
+	if (own)
+		pfree(own);
+}
+
+static void
+appender_scan_init_segs(AppenderScanDesc scan)
+{
+	Relation	rel = scan->rs_base.rs_rd;
+	Snapshot	snapshot = scan->rs_base.rs_snapshot;
+	MemoryContext oldctx = MemoryContextSwitchTo(scan->mcxt);
+
+	if (scan->rs_base.rs_parallel)
+	{
+		AppenderParallelScanData *p = (AppenderParallelScanData *) scan->rs_base.rs_parallel;
+
+		scan->nsegs = appender_visible_segments(&rel->rd_locator,
+												appender_meta_snapshot(snapshot),
+												p->own, p->nown, &scan->segs);
+	}
+	else
+	{
+		appender_collect_segments(rel, appender_meta_snapshot(snapshot), true,
+								  appender_snapshot_cid(snapshot),
+								  &scan->segs, &scan->nsegs);
+	}
+
+	scan->cur = -1;
+	scan->range = 1;
+	scan->off = scan->range_start = scan->range_end = scan->vbase = 0;
+	scan->loaded = false;
+	MemoryContextSwitchTo(oldctx);
+}
+
+static File
+appender_scan_file(AppenderScanDesc scan, int segno)
+{
+	if (scan->file < 0 || scan->file_segno != segno)
+	{
+		if (scan->file >= 0)
+			FileClose(scan->file);
+		scan->file = appender_seg_open(&scan->rs_base.rs_rd->rd_locator, segno);
+		scan->file_segno = segno;
+	}
+	return scan->file;
+}
+
+/* Move to the next non-empty byte range; false at the end of the scan. */
+static bool
+appender_scan_next_range(AppenderScanDesc scan)
+{
+	scan->vbase += scan->range_end - scan->range_start;
+	scan->off = scan->range_start = scan->range_end = 0;
+	scan->loaded = false;
+
+	for (;;)
+	{
+		AppenderScanSeg *s;
+
+		if (scan->cur >= 0 && scan->cur < scan->nsegs && scan->range == 0)
+		{
+			s = &scan->segs[scan->cur];
+			scan->range = 1;
+			if (s->own_eof > s->own_off)
+			{
+				scan->off = scan->range_start = s->own_off;
+				scan->range_end = s->own_eof;
+				return true;
+			}
+		}
+
+		scan->cur++;
+		if (scan->cur >= scan->nsegs)
+		{
+			scan->cur = scan->nsegs;
+			return false;
+		}
+
+		scan->range = 0;
+		s = &scan->segs[scan->cur];
+		if (s->eof > APPENDER_SEG_DATA_START)
+		{
+			scan->off = scan->range_start = APPENDER_SEG_DATA_START;
+			scan->range_end = s->eof;
+			return true;
+		}
+	}
+}
+
+static void
+appender_scan_read_payload(AppenderScanDesc scan, File file, int64 off)
+{
+	if (scan->hdr.datalen > scan->blockcap)
+	{
+		if (scan->block)
+			pfree(scan->block);
+		scan->block = MemoryContextAlloc(scan->mcxt, scan->hdr.datalen);
+		scan->blockcap = scan->hdr.datalen;
+	}
+	appender_seg_read_payload(file, off, &scan->hdr, scan->block);
+	scan->loaded = true;
+	scan->row = 0;
+	scan->rowoff = 0;
+}
+
+static void
+appender_check_block(AppenderScanDesc scan, File file, int64 off, int64 end)
+{
+	if (off + appender_block_size(&scan->hdr) > end)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block at offset " INT64_FORMAT " of file \"%s\" extends past the segment end",
+						(int64) off, FilePathName(file))));
+}
+
+/* Read the block at scan->off (header only unless payload) and step past it. */
+static void
+appender_scan_load(AppenderScanDesc scan, bool payload)
+{
+	AppenderScanSeg *s = &scan->segs[scan->cur];
+	File		file = appender_scan_file(scan, s->segno);
+
+	for (;;)
+	{
+		appender_seg_read_header(file, scan->off, &scan->hdr);
+		appender_check_block(scan, file, scan->off, scan->range_end);
+		if (scan->hdr.kind == APPENDER_BLOCK_KIND_DATA)
+			break;
+		scan->off += appender_block_size(&scan->hdr);
+		if (scan->off >= scan->range_end)
+			return;				/* only value blocks remain */
+	}
+	if (payload)
+		appender_scan_read_payload(scan, file, scan->off);
+	scan->off += appender_block_size(&scan->hdr);
+}
+
+/* Byte range of (seg, range); false if it is empty. */
+static bool
+appender_range_bounds(AppenderScanDesc scan, int seg, int range,
+					  int64 *lo, int64 *hi)
+{
+	AppenderScanSeg *s;
+
+	if (seg >= scan->nsegs)
+		return false;
+	s = &scan->segs[seg];
+	*lo = range == 0 ? APPENDER_SEG_DATA_START : s->own_off;
+	*hi = range == 0 ? s->eof : s->own_eof;
+	return *hi > *lo;
+}
+
+/*
+ * Claim the next block of a parallel scan.  Workers advance the shared
+ * cursor past a block with compare-and-swap once they have read its header;
+ * the payload is read and decoded outside of any coordination.
+ */
+static bool
+appender_parallel_claim(AppenderScanDesc scan)
+{
+	AppenderParallelScanData *p = (AppenderParallelScanData *) scan->rs_base.rs_parallel;
+	uint64		cur = pg_atomic_read_u64(&p->cursor);
+
+	for (;;)
+	{
+		int			seg = APPENDER_CURSOR_SEG(cur);
+		int			range = APPENDER_CURSOR_RANGE(cur);
+		int64		off = APPENDER_CURSOR_OFF(cur);
+		int64		lo;
+		int64		hi;
+		File		file;
+
+		if (!appender_range_bounds(scan, seg, range, &lo, &hi) || off >= hi)
+		{
+			/* step to the start of the next non-empty range */
+			do
+			{
+				if (seg >= scan->nsegs)
+					return false;
+				if (range == 0)
+					range = 1;
+				else
+				{
+					seg++;
+					range = 0;
+				}
+			} while (!appender_range_bounds(scan, seg, range, &lo, &hi));
+
+			pg_atomic_compare_exchange_u64(&p->cursor, &cur,
+										   APPENDER_CURSOR(seg, range, lo));
+			cur = pg_atomic_read_u64(&p->cursor);
+			continue;
+		}
+
+		if (off < lo)
+		{
+			pg_atomic_compare_exchange_u64(&p->cursor, &cur,
+										   APPENDER_CURSOR(seg, range, lo));
+			cur = pg_atomic_read_u64(&p->cursor);
+			continue;
+		}
+
+		file = appender_scan_file(scan, scan->segs[seg].segno);
+		appender_seg_read_header(file, off, &scan->hdr);
+		appender_check_block(scan, file, off, hi);
+
+		if (pg_atomic_compare_exchange_u64(&p->cursor, &cur,
+										   APPENDER_CURSOR(seg, range,
+														   off + appender_block_size(&scan->hdr))))
+		{
+			scan->cur = seg;
+			appender_scan_read_payload(scan, file, off);
+			return true;
+		}
+		/* another participant took it; cur now holds the new position */
+	}
+}
+
+static MemTuple
+appender_block_row(const AppenderBlockHeader *hdr, char *block, uint32 rowoff)
+{
+	MemTuple	mtup = (MemTuple) (block + rowoff);
+
+	if (rowoff + sizeof(uint32) > hdr->datalen ||
+		!memtuple_lead_bit_set(mtup) ||
+		rowoff + memtuple_get_size(mtup) > hdr->datalen)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid row at offset %u of an appender block", rowoff)));
+	return mtup;
+}
+
+static void
+appender_free_binding(MemTupleBinding *bind)
+{
+	FreeTupleDesc(bind->tupdesc);
+	destroy_memtuple_binding(bind);
+}
+
+/*
+ * Layout of rows formed with natts attributes, as seen through desc.  The
+ * descriptor is the slot's, not the relation's: a table rewrite reads the
+ * old rows through the pre-ALTER descriptor.
+ */
+static MemTupleBinding *
+appender_make_binding(TupleDesc desc, int natts)
+{
+	if (natts > desc->natts)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("appender block has %d attributes, the table only %d",
+						natts, desc->natts)));
+	return create_memtuple_binding(appender_truncated_tupdesc(desc, natts));
+}
+
+static void
+appender_scan_emit(AppenderScanDesc scan, TupleTableSlot *slot)
+{
+	Relation	rel = scan->rs_base.rs_rd;
+	TupleDesc	desc = slot->tts_tupleDescriptor;
+	MemTuple	mtup = appender_block_row(&scan->hdr, scan->block, scan->rowoff);
+
+	if (scan->bind == NULL || scan->bind_desc != desc ||
+		scan->bind_natts != scan->hdr.natts)
+	{
+		MemoryContext oldctx = MemoryContextSwitchTo(scan->mcxt);
+
+		if (scan->bind)
+			appender_free_binding(scan->bind);
+		scan->bind = NULL;
+		scan->bind = appender_make_binding(desc, scan->hdr.natts);
+		scan->bind_desc = desc;
+		scan->bind_natts = scan->hdr.natts;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	if (slot->tts_ops == &appender_slot_ops)
+		appender_slot_store(slot, mtup, scan->bind, scan->hdr.natts);
+	else
+	{
+		ExecClearTuple(slot);
+		appender_deform(mtup, scan->bind, scan->hdr.natts, desc, slot);
+		ExecStoreVirtualTuple(slot);
+	}
+	appender_tid_set(&slot->tts_tid, scan->segs[scan->cur].segno,
+					 scan->hdr.first_rownum + scan->row);
+	slot->tts_tableOid = RelationGetRelid(rel);
+
+	scan->rowoff += memtuple_get_size(mtup);
+	scan->row++;
+}
+
+static TableScanDesc
+appender_beginscan(Relation rel, Snapshot snapshot, int nkeys, ScanKey key,
+				   ParallelTableScanDesc pscan, uint32 flags)
+{
+	AppenderScanDesc scan;
+
+	if (nkeys > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("scan keys are not supported for appender tables")));
+
+	RelationIncrementReferenceCount(rel);
+
+	if (snapshot == NULL)
+	{
+		snapshot = RegisterSnapshot(GetLatestSnapshot());
+		flags |= SO_TEMP_SNAPSHOT;
+	}
+
+	scan = palloc0(sizeof(AppenderScanDescData));
+	scan->rs_base.rs_rd = rel;
+	scan->rs_base.rs_snapshot = snapshot;
+	scan->rs_base.rs_flags = flags;
+	scan->rs_base.rs_parallel = pscan;
+	scan->mcxt = CurrentMemoryContext;
+	scan->file = -1;
+
+	if (flags & SO_TYPE_SEQSCAN)
+		PredicateLockRelation(rel, snapshot);
+
+	appender_scan_init_segs(scan);
+	return (TableScanDesc) scan;
+}
+
+static void
+appender_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
+				bool allow_strat, bool allow_sync, bool allow_pagemode)
+{
+	AppenderScanDesc scan = (AppenderScanDesc) sscan;
+
+	if (scan->segs)
+		pfree(scan->segs);
+	appender_scan_init_segs(scan);
+}
+
+static void
+appender_endscan(TableScanDesc sscan)
+{
+	AppenderScanDesc scan = (AppenderScanDesc) sscan;
+
+	if (scan->file >= 0)
+		FileClose(scan->file);
+	if (scan->block)
+		pfree(scan->block);
+	if (scan->bind)
+		appender_free_binding(scan->bind);
+	if (scan->segs)
+		pfree(scan->segs);
+	if (scan->rs_base.rs_flags & SO_TEMP_SNAPSHOT)
+		UnregisterSnapshot(scan->rs_base.rs_snapshot);
+	RelationDecrementReferenceCount(scan->rs_base.rs_rd);
+	pfree(scan);
+}
+
+static bool
+appender_getnextslot(TableScanDesc sscan, ScanDirection direction,
+					 TupleTableSlot *slot)
+{
+	AppenderScanDesc scan = (AppenderScanDesc) sscan;
+
+	if (ScanDirectionIsBackward(direction))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("backward scans of appender tables are not supported")));
+
+	for (;;)
+	{
+		if (scan->loaded && scan->row < scan->hdr.rowcount)
+		{
+			appender_scan_emit(scan, slot);
+			return true;
+		}
+		scan->loaded = false;
+
+		if (scan->rs_base.rs_parallel)
+		{
+			if (!appender_parallel_claim(scan))
+			{
+				ExecClearTuple(slot);
+				return false;
+			}
+		}
+		else if (scan->off < scan->range_end)
+			appender_scan_load(scan, true);
+		else if (!appender_scan_next_range(scan))
+		{
+			ExecClearTuple(slot);
+			return false;
+		}
+	}
+}
+
+/*
+ * ANALYZE samples "blocks" of BLCKSZ bytes of the concatenated data ranges,
+ * as sized by appender_relation_size().  A sampled range yields the rows of
+ * the blocks that start inside it, so every block is counted exactly once.
+ * Sample positions arrive in increasing order, so one forward pass over the
+ * block headers serves the whole ANALYZE.
+ */
+static bool
+appender_scan_analyze_next_block(TableScanDesc sscan, ReadStream *stream)
+{
+	AppenderScanDesc scan = (AppenderScanDesc) sscan;
+	BufferAccessStrategy strategy;
+	BlockNumber blkno = read_stream_next_block(stream, &strategy);
+	int64		lo;
+
+	if (blkno == InvalidBlockNumber)
+		return false;
+
+	lo = (int64) blkno * BLCKSZ;
+	scan->an_hi = lo + BLCKSZ;
+	scan->loaded = false;
+
+	for (;;)
+	{
+		if (scan->off >= scan->range_end)
+		{
+			if (!appender_scan_next_range(scan))
+				break;
+			continue;
+		}
+		if (scan->vbase + (scan->off - scan->range_start) >= lo)
+			break;
+		appender_scan_load(scan, false);
+	}
+	return true;
+}
+
+static bool
+appender_scan_analyze_next_tuple(APPENDER_ANALYZE_NEXT_TUPLE_ARGS)
+{
+	AppenderScanDesc scan = (AppenderScanDesc) sscan;
+
+	for (;;)
+	{
+		if (scan->loaded && scan->row < scan->hdr.rowcount)
+		{
+			appender_scan_emit(scan, slot);
+			*liverows += 1;
+			return true;
+		}
+		scan->loaded = false;
+
+		if (scan->off >= scan->range_end)
+		{
+			if (!appender_scan_next_range(scan))
+				return false;
+			continue;
+		}
+		if (scan->vbase + (scan->off - scan->range_start) >= scan->an_hi)
+			return false;
+		appender_scan_load(scan, true);
+	}
+}
+
+/* ----------------------------------------------------------------------------
+ * Parallel scans hand out blocks through a shared cursor.
+ * -------------------------------------------------------------------------
+ */
+
+static Size
+appender_parallelscan_size(int nown)
+{
+	return MAXALIGN(add_size(offsetof(AppenderParallelScanData, own),
+							 mul_size(nown, sizeof(AppenderScanSeg))));
+}
+
+static Size
+appender_parallelscan_estimate(Relation rel)
+{
+	AppenderScanSeg *own;
+	int			nown;
+
+	/* workers read the files, so the leader's buffered rows go first */
+	appender_writer_flush(&rel->rd_locator);
+	nown = appender_own_segments(&rel->rd_locator, appender_active_cid(), &own);
+	return appender_parallelscan_size(nown);
+}
+
+static Size
+appender_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
+{
+	AppenderParallelScanData *p = (AppenderParallelScanData *) pscan;
+	AppenderScanSeg *own;
+	int			nown = appender_own_segments(&rel->rd_locator,
+											 appender_active_cid(), &own);
+
+	APPENDER_PSCAN_SET_LOCATOR(&p->base, rel);
+	p->base.phs_syncscan = false;
+	pg_atomic_init_u64(&p->cursor, 0);
+	p->nown = nown;
+	if (nown > 0)
+		memcpy(p->own, own, nown * sizeof(AppenderScanSeg));
+	return appender_parallelscan_size(nown);
+}
+
+static void
+appender_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
+{
+	pg_atomic_write_u64(&((AppenderParallelScanData *) pscan)->cursor, 0);
+}
+
+/* ----------------------------------------------------------------------------
+ * Row fetch by TID
+ * -------------------------------------------------------------------------
+ */
+
+/* Last block located by TID, to make sequential TID lookups cheap. */
+static struct
+{
+	RelFileLocator rlocator;
+	int			segno;
+	int64		range_start;
+	int64		blockoff;
+	uint32		first;
+	uint64		generation;		/* appender_seg_generation when filled */
+	bool		valid;
+}			appender_fetch_cache;
+
+/* Find which visible byte range holds rownum of segno; false if none. */
+static bool
+appender_locate_row(Relation rel, Snapshot snapshot, int segno, uint32 rownum,
+					int64 *lo, int64 *hi)
+{
+	AppenderScanSeg *own;
+	int			nown;
+	bool		latest = !IsMVCCSnapshot(snapshot);
+	bool		found = false;
+
+	appender_writer_flush(&rel->rd_locator);
+	nown = appender_own_segments(&rel->rd_locator,
+								 appender_snapshot_cid(snapshot), &own);
+
+	/*
+	 * A cached manifest view can only lag behind what was committed; when the
+	 * row is not in it, re-read the manifest once before giving up.
+	 */
+	for (int attempt = 0; attempt < 2 && !found; attempt++)
+	{
+		AppenderScanSeg *segs;
+		int			nsegs;
+
+		nsegs = appender_visible_segments_cached(&rel->rd_locator,
+												 appender_meta_snapshot(snapshot),
+												 latest, own, nown, &segs,
+												 attempt > 0);
+
+		for (int i = 0; i < nsegs && !found; i++)
+		{
+			AppenderScanSeg *s = &segs[i];
+
+			if (s->segno != segno)
+				continue;
+			if (rownum < s->rows)
+			{
+				*lo = APPENDER_SEG_DATA_START;
+				*hi = s->eof;
+				found = true;
+			}
+			else if (rownum >= s->own_first &&
+					 rownum - s->own_first < s->own_rows)
+			{
+				*lo = s->own_off;
+				*hi = s->own_eof;
+				found = true;
+			}
+		}
+		pfree(segs);
+	}
+
+	if (own)
+		pfree(own);
+	return found;
+}
+
+/*
+ * Open the block of segment segno that holds rownum, seeded by the last
+ * block located by TID.  The one-entry cache makes sequential TID lookups
+ * O(1) per row.
+ */
+static bool
+appender_fetch_block(Relation rel, Snapshot snapshot, int segno, uint32 rownum,
+					 File *file, AppenderBlockHeader *hdr, int64 *blockoff)
+{
+	int64		lo;
+	int64		hi;
+	int64		off;
+
+	if (!appender_locate_row(rel, snapshot, segno, rownum, &lo, &hi))
+		return false;
+
+	off = lo;
+	if (appender_fetch_cache.valid &&
+		appender_fetch_cache.generation == appender_seg_generation &&
+		RelFileLocatorEquals(appender_fetch_cache.rlocator, rel->rd_locator) &&
+		appender_fetch_cache.segno == segno &&
+		appender_fetch_cache.range_start == lo &&
+		appender_fetch_cache.first <= rownum &&
+		appender_fetch_cache.blockoff < hi)
+		off = appender_fetch_cache.blockoff;
+
+	*file = appender_seg_open_cached(&rel->rd_locator, segno);
+	for (;;)
+	{
+		if (off >= hi)
+			return false;
+		appender_seg_read_header(*file, off, hdr);
+		if (off + appender_block_size(hdr) > hi)
+			return false;
+		if (hdr->kind == APPENDER_BLOCK_KIND_DATA &&
+			rownum >= hdr->first_rownum &&
+			rownum - hdr->first_rownum < hdr->rowcount)
+		{
+			*blockoff = off;
+
+			appender_fetch_cache.rlocator = rel->rd_locator;
+			appender_fetch_cache.segno = segno;
+			appender_fetch_cache.range_start = lo;
+			appender_fetch_cache.blockoff = off;
+			appender_fetch_cache.first = hdr->first_rownum;
+			appender_fetch_cache.generation = appender_seg_generation;
+			appender_fetch_cache.valid = true;
+			return true;
+		}
+		off += appender_block_size(hdr);
+	}
+}
+
+/*
+ * Deform the row at rownum of an already-located block into the slot as a
+ * materialized virtual tuple, keeping the TID.
+ */
+static void
+appender_deform_into_slot(Relation rel, File file, int64 blockoff,
+						  const AppenderBlockHeader *hdr, uint32 rownum,
+						  ItemPointer tid, TupleTableSlot *slot)
+{
+	char	   *payload;
+	uint32		rowoff = 0;
+	MemTuple	mtup;
+
+	payload = palloc(Max(hdr->datalen, 1));
+	appender_seg_read_payload(file, blockoff, hdr, payload);
+
+	for (uint32 i = hdr->first_rownum; i < rownum; i++)
+		rowoff += memtuple_get_size(appender_block_row(hdr, payload, rowoff));
+	mtup = appender_block_row(hdr, payload, rowoff);
+
+	ExecClearTuple(slot);
+	if (slot->tts_tupleDescriptor == RelationGetDescr(rel))
+		appender_deform(mtup, appender_binding(rel, hdr->natts), hdr->natts,
+						slot->tts_tupleDescriptor, slot);
+	else
+	{
+		MemTupleBinding *bind = appender_make_binding(slot->tts_tupleDescriptor,
+													  hdr->natts);
+
+		appender_deform(mtup, bind, hdr->natts, slot->tts_tupleDescriptor, slot);
+		appender_free_binding(bind);
+	}
+	ExecStoreVirtualTuple(slot);
+	ExecMaterializeSlot(slot);
+	slot->tts_tid = *tid;
+	slot->tts_tableOid = RelationGetRelid(rel);
+	pfree(payload);
+}
+
+static bool
+appender_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot,
+						   TupleTableSlot *slot)
+{
+	int			segno;
+	uint32		rownum;
+	File		file;
+	AppenderBlockHeader hdr;
+	int64		blockoff;
+
+	if (!appender_tid_is_valid(tid))
+		return false;
+	segno = appender_tid_segno(tid);
+	rownum = appender_tid_rownum(tid);
+
+	if (!appender_fetch_block(rel, snapshot, segno, rownum,
+							  &file, &hdr, &blockoff))
+		return false;
+
+	appender_deform_into_slot(rel, file, blockoff, &hdr, rownum, tid, slot);
+	return true;
+}
+
+static bool
+appender_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
+{
+	return appender_tid_is_valid(tid);
+}
+
+static void
+appender_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid)
+{
+	/* rows are never updated: a TID is always the latest version */
+}
+
+static bool
+appender_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
+								  Snapshot snapshot)
+{
+	int64		lo;
+	int64		hi;
+
+	return appender_tid_is_valid(&slot->tts_tid) &&
+		appender_locate_row(rel, snapshot, appender_tid_segno(&slot->tts_tid),
+							appender_tid_rownum(&slot->tts_tid), &lo, &hi);
+}
+
+/* ----------------------------------------------------------------------------
+ * Modifications
+ * -------------------------------------------------------------------------
+ */
+
+static void
+appender_tuple_insert(APPENDER_INSERT_ARGS)
+{
+	appender_writer_insert(rel, slot, cid);
+}
+
+static void
+appender_multi_insert(APPENDER_MULTI_INSERT_ARGS)
+{
+	appender_writer_insert_batch(rel, slots, nslots, cid);
+}
+
+static void
+appender_finish_bulk_insert(APPENDER_FINISH_BULK_INSERT_ARGS)
+{
+}
+
+static void
+appender_tuple_insert_speculative(APPENDER_INSERT_SPECULATIVE_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("INSERT ... ON CONFLICT is not supported for appender tables")));
+}
+
+static void
+appender_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
+									uint32 specToken, bool succeeded)
+{
+	elog(ERROR, "appender: unexpected speculative insertion");
+}
+
+static TM_Result
+appender_tuple_delete(APPENDER_DELETE_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("DELETE is not supported for appender tables")));
+	pg_unreachable();
+}
+
+static TM_Result
+appender_tuple_update(APPENDER_UPDATE_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("UPDATE is not supported for appender tables")));
+	pg_unreachable();
+}
+
+/*
+ * Rows can never be updated or deleted, so there is nothing to wait for or
+ * conflict with: report the row as locked if it is visible.
+ */
+static TM_Result
+appender_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
+					TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
+					LockWaitPolicy wait_policy, uint8 flags,
+					TM_FailureData *tmfd)
+{
+	/*
+	 * Rows are never updated, so a successful lock can never have followed an
+	 * update chain.  Initialize the flag for every return path.
+	 */
+	tmfd->traversed = false;
+
+	if (!appender_fetch_row_version(rel, tid, snapshot, slot))
+	{
+		tmfd->ctid = *tid;
+		tmfd->xmax = InvalidTransactionId;
+		tmfd->cmax = InvalidCommandId;
+		return TM_Invisible;
+	}
+	return TM_Ok;
+}
+
+/* ----------------------------------------------------------------------------
+ * Logical replication
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * Rows of this access method never reach the heap WAL records that logical
+ * decoding looks at, so an appender table covered by a publication would
+ * replicate nothing at all.  Both orders of events are rejected: a publication
+ * that starts to cover an existing appender table, and an appender table that
+ * falls under an existing publication.
+ */
+
+/*
+ * Name of an appender table in the given namespace, or anywhere in the
+ * database when nspid is InvalidOid.  NULL when there is none.
+ */
+static char *
+appender_find_table(Oid nspid)
+{
+	Relation	classRel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	Oid			amoid = get_table_am_oid("appender", true);
+	char	   *relname = NULL;
+
+	if (!OidIsValid(amoid))
+		return NULL;
+
+	classRel = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(classRel, InvalidOid, false, NULL, 0, NULL);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+
+		if (form->relam != amoid)
+			continue;
+		if (OidIsValid(nspid) && form->relnamespace != nspid)
+			continue;
+
+		relname = pstrdup(NameStr(form->relname));
+		break;
+	}
+
+	systable_endscan(scan);
+	table_close(classRel, AccessShareLock);
+
+	return relname;
+}
+
+static void
+appender_reject_publication(const char *relname)
+{
+	if (relname == NULL)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot publish appender table \"%s\"", relname),
+			 errdetail("Logical replication cannot decode changes to appender tables.")));
+}
+
+/*
+ * Refuse to turn a relation into an appender table while a publication already
+ * replicates it.
+ */
+static void
+appender_check_not_replicated(Oid nspid)
+{
+	List	   *pubs;
+
+	pubs = GetAllTablesPublications();
+	if (pubs != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("appender tables cannot be replicated"),
+				 errdetail("Publication \"%s\" replicates every table in this database, and logical replication cannot decode changes to appender tables.",
+						   get_publication_name(linitial_oid(pubs), false))));
+
+	pubs = GetSchemaPublications(nspid);
+	if (pubs != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("appender tables cannot be replicated"),
+				 errdetail("Publication \"%s\" replicates every table in schema \"%s\", and logical replication cannot decode changes to appender tables.",
+						   get_publication_name(linitial_oid(pubs), false),
+						   get_namespace_name(nspid))));
+}
+
+/*
+ * Same check for a relation that was just created.  Partitioned tables carry no
+ * storage of their own and so never reach
+ * appender_relation_set_new_filelocator(); they are checked here instead.  The
+ * catalog snapshot cannot see a row inserted by the current command, hence the
+ * scan under SnapshotSelf.
+ */
+static void
+appender_check_created_relation(Oid relid)
+{
+	Relation	classRel;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tup;
+	Oid			amoid = get_table_am_oid("appender", true);
+	Oid			nspid = InvalidOid;
+
+	if (!OidIsValid(amoid))
+		return;
+
+	classRel = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(classRel, ClassOidIndexId, true, SnapshotSelf,
+							  1, &key);
+
+	tup = systable_getnext(scan);
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+
+		if (form->relam == amoid)
+			nspid = form->relnamespace;
+	}
+
+	systable_endscan(scan);
+	table_close(classRel, AccessShareLock);
+
+	if (OidIsValid(nspid))
+		appender_check_not_replicated(nspid);
+}
+
+/* ----------------------------------------------------------------------------
+ * DDL
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * New storage for a relation: CREATE, TRUNCATE or a table rewrite.  The
+ * previous storage, if any, goes away at commit; the new one at abort.
+ * Segment files carry no transaction ids, so there is nothing to freeze.
+ */
+static void
+appender_relation_set_new_filelocator(Relation rel,
+									  const RelFileLocator *newrlocator,
+									  char persistence,
+									  TransactionId *freezeXid,
+									  MultiXactId *minmulti)
+{
+	SMgrRelation srel;
+
+	if (persistence != RELPERSISTENCE_PERMANENT)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("appender tables must be permanent"),
+				 errdetail("Unlogged and temporary appender tables are not supported.")));
+
+	appender_check_not_replicated(RelationGetNamespace(rel));
+
+	*freezeXid = InvalidTransactionId;
+	*minmulti = InvalidMultiXactId;
+
+	srel = RelationCreateStorage(*newrlocator, persistence, true);
+	smgrclose(srel);
+
+	if (!RelFileLocatorEquals(*newrlocator, rel->rd_locator))
+	{
+		appender_storage_drop_at_commit(&rel->rd_locator);
+		appender_meta_delete(&rel->rd_locator);
+	}
+	appender_storage_drop_at_abort(newrlocator);
+}
+
+/*
+ * TRUNCATE of storage created in the current (sub)transaction: a rollback
+ * removes the storage anyway, so it is emptied in place.
+ */
+static void
+appender_relation_nontransactional_truncate(Relation rel)
+{
+	appender_writer_discard(&rel->rd_locator);
+	if (appender_seg_unlink_all(&rel->rd_locator) > 0)
+		appender_xlog_unlink(&rel->rd_locator, 0);
+	appender_meta_delete(&rel->rd_locator);
+	RelationTruncate(rel, 0);
+}
+
+static void
+appender_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("moving appender tables to another tablespace is not supported")));
+}
+
+static void
+appender_relation_copy_for_cluster(APPENDER_COPY_FOR_CLUSTER_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("CLUSTER and VACUUM FULL are not supported for appender tables")));
+}
+
+/* Committed data bytes and rows plus this backend's own appends. */
+static void
+appender_relation_totals(Relation rel, int64 *bytes, int64 *rows)
+{
+	AppenderScanSeg *segs;
+	int			nsegs;
+
+	appender_collect_segments(rel, GetLatestSnapshot(), false, InvalidCommandId,
+							  &segs, &nsegs);
+
+	*bytes = 0;
+	*rows = 0;
+	for (int i = 0; i < nsegs; i++)
+	{
+		*bytes += Max(segs[i].eof - APPENDER_SEG_DATA_START, 0) +
+			(segs[i].own_eof - segs[i].own_off);
+		*rows += (int64) segs[i].rows + segs[i].own_rows;
+	}
+	pfree(segs);
+}
+
+/*
+ * Disk footprint of the committed segments, as they are on disk: data blocks,
+ * value blocks, the value directory and the preallocated tail.  This is what
+ * pg_relation_size() and pg_database_size() report.
+ *
+ * appender_relation_totals() answers a different question -- how many bytes
+ * and rows the table logically holds -- which is what the planner and VACUUM
+ * need.
+ */
+static int64
+appender_disk_size(Relation rel)
+{
+	AppenderScanSeg *segs;
+	int			nsegs;
+	int64		size = 0;
+
+	appender_collect_segments(rel, GetLatestSnapshot(), false, InvalidCommandId,
+							  &segs, &nsegs);
+	for (int i = 0; i < nsegs; i++)
+		size += appender_seg_disk_size(&rel->rd_locator, segs[i].segno);
+	pfree(segs);
+
+	return size;
+}
+
+static void
+appender_vacuum_rel(Relation rel, APPENDER_VACUUM_PARAMS params,
+					BufferAccessStrategy bstrategy)
+{
+#if PG_VERSION_NUM >= 180000
+	TimestampTz starttime = GetCurrentTimestamp();
+#endif
+	int64		bytes;
+	int64		rows;
+	TransactionId frozenxid = InvalidTransactionId;
+	MultiXactId minmulti = InvalidMultiXactId;
+	bool		frozenxid_updated;
+	bool		minmulti_updated;
+
+	/* nothing to prune or freeze: just refresh the statistics */
+	appender_relation_totals(rel, &bytes, &rows);
+
+	/*
+	 * relpages is the size of the on-disk representation, and ANALYZE fills
+	 * it in from RelationGetNumberOfBlocks(), which reaches this method's
+	 * relation_size callback.  Report the same thing here, or the two
+	 * commands would leave different numbers in the catalog: the logical byte
+	 * count above leaves out the preallocated tail.
+	 */
+	bytes = appender_disk_size(rel);
+
+	if (params->options & VACOPT_VERBOSE)
+		ereport(INFO,
+				(errmsg("vacuuming \"%s.%s\"",
+						get_namespace_name(RelationGetNamespace(rel)),
+						RelationGetRelationName(rel))));
+
+	/*
+	 * Rows carry no xids, so both horizons can move to "now" at no cost to
+	 * correctness.  That matters for a table that was heap before ALTER TABLE
+	 * ... SET ACCESS METHOD made it an appender: it keeps the horizons of its
+	 * heap life, and vac_update_datfrozenxid() takes the minimum over every
+	 * relation that has a valid one, so a stale value here would peg the
+	 * horizon of the whole database and, in the end, stop the cluster for
+	 * wraparound.  A table created as appender has neither horizon set and
+	 * keeps it that way: passing InvalidTransactionId tells
+	 * vac_update_relstats to leave them alone, which keeps the table out of
+	 * autovacuum's wraparound accounting altogether.
+	 */
+	if (TransactionIdIsValid(rel->rd_rel->relfrozenxid))
+		frozenxid = GetOldestNonRemovableTransactionId(NULL);
+	if (MultiXactIdIsValid(rel->rd_rel->relminmxid))
+		minmulti = GetOldestMultiXactId();
+
+#if PG_VERSION_NUM >= 180000
+	vac_update_relstats(rel, (BlockNumber) ((bytes + BLCKSZ - 1) / BLCKSZ),
+						(double) rows, 0, 0, false,
+						frozenxid, minmulti,
+						&frozenxid_updated, &minmulti_updated, false);
+#else
+	vac_update_relstats(rel, (BlockNumber) ((bytes + BLCKSZ - 1) / BLCKSZ),
+						(double) rows, 0, false,
+						frozenxid, minmulti,
+						&frozenxid_updated, &minmulti_updated, false);
+#endif
+
+#if PG_VERSION_NUM >= 190000
+	pgstat_report_vacuum(rel, rows, 0, starttime);
+#elif PG_VERSION_NUM >= 180000
+	pgstat_report_vacuum(RelationGetRelid(rel), rel->rd_rel->relisshared,
+						 rows, 0, starttime);
+#else
+	pgstat_report_vacuum(RelationGetRelid(rel), rel->rd_rel->relisshared,
+						 rows, 0);
+#endif
+}
+
+static uint64
+appender_relation_size(Relation rel, ForkNumber forknum)
+{
+	if (forknum != MAIN_FORKNUM && forknum != InvalidForkNumber)
+		return 0;
+	return (uint64) appender_disk_size(rel);
+}
+
+static void
+appender_relation_estimate_size(Relation rel, int32 *attr_widths,
+								BlockNumber *pages, double *tuples,
+								double *allvisfrac)
+{
+	int64		bytes;
+	int64		rows;
+
+	appender_relation_totals(rel, &bytes, &rows);
+	*pages = (BlockNumber) ((bytes + BLCKSZ - 1) / BLCKSZ);
+	*tuples = (double) rows;
+	*allvisfrac = 0;
+}
+
+static bool
+appender_relation_needs_toast_table(Relation rel)
+{
+	return false;
+}
+
+/* ----------------------------------------------------------------------------
+ * Not supported
+ * -------------------------------------------------------------------------
+ */
+
+static void
+appender_not_supported(const char *what)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s is not supported for appender tables", what)));
+}
+
+static IndexFetchTableData *
+appender_index_fetch_begin(APPENDER_INDEX_FETCH_BEGIN_ARGS)
+{
+	appender_not_supported("indexing");
+	pg_unreachable();
+}
+
+static void
+appender_index_fetch_reset(IndexFetchTableData *scan)
+{
+}
+
+static void
+appender_index_fetch_end(IndexFetchTableData *scan)
+{
+}
+
+static bool
+appender_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid,
+						   Snapshot snapshot, TupleTableSlot *slot,
+						   bool *call_again, bool *all_dead)
+{
+	appender_not_supported("indexing");
+	pg_unreachable();
+}
+
+static TransactionId
+appender_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
+{
+	appender_not_supported("indexing");
+	pg_unreachable();
+}
+
+static double
+appender_index_build_range_scan(Relation table_rel, Relation index_rel,
+								struct IndexInfo *index_info, bool allow_sync,
+								bool anyvisible, bool progress,
+								BlockNumber start_blockno,
+								BlockNumber numblocks,
+								IndexBuildCallback callback,
+								void *callback_state, TableScanDesc scan)
+{
+	appender_not_supported("indexing");
+	pg_unreachable();
+}
+
+static void
+appender_index_validate_scan(Relation table_rel, Relation index_rel,
+							 struct IndexInfo *index_info, Snapshot snapshot,
+							 struct ValidateIndexState *state)
+{
+	appender_not_supported("indexing");
+}
+
+/* 17 scans bitmaps through a pair of callbacks, 18 through a single one. */
+#if PG_VERSION_NUM < 180000
+static bool
+appender_scan_bitmap_next_block(TableScanDesc scan,
+								struct TBMIterateResult *tbmres)
+{
+	appender_not_supported("bitmap scanning");
+	pg_unreachable();
+}
+#endif
+
+static bool
+appender_scan_bitmap_next_tuple(APPENDER_BITMAP_NEXT_TUPLE_ARGS)
+{
+	appender_not_supported("bitmap scanning");
+	pg_unreachable();
+}
+
+static bool
+appender_scan_sample_next_block(TableScanDesc scan,
+								struct SampleScanState *scanstate)
+{
+	appender_not_supported("TABLESAMPLE");
+	pg_unreachable();
+}
+
+static bool
+appender_scan_sample_next_tuple(TableScanDesc scan,
+								struct SampleScanState *scanstate,
+								TupleTableSlot *slot)
+{
+	appender_not_supported("TABLESAMPLE");
+	pg_unreachable();
+}
+
+static const TupleTableSlotOps *
+appender_slot_callbacks(Relation rel)
+{
+	return &appender_slot_ops;
+}
+
+static const TableAmRoutine appender_methods = {
+	.type = T_TableAmRoutine,
+
+	.slot_callbacks = appender_slot_callbacks,
+
+	.scan_begin = appender_beginscan,
+	.scan_end = appender_endscan,
+	.scan_rescan = appender_rescan,
+	.scan_getnextslot = appender_getnextslot,
+
+	.parallelscan_estimate = appender_parallelscan_estimate,
+	.parallelscan_initialize = appender_parallelscan_initialize,
+	.parallelscan_reinitialize = appender_parallelscan_reinitialize,
+
+	.index_fetch_begin = appender_index_fetch_begin,
+	.index_fetch_reset = appender_index_fetch_reset,
+	.index_fetch_end = appender_index_fetch_end,
+	.index_fetch_tuple = appender_index_fetch_tuple,
+
+	.tuple_fetch_row_version = appender_fetch_row_version,
+	.tuple_tid_valid = appender_tuple_tid_valid,
+	.tuple_get_latest_tid = appender_tuple_get_latest_tid,
+	.tuple_satisfies_snapshot = appender_tuple_satisfies_snapshot,
+	.index_delete_tuples = appender_index_delete_tuples,
+
+	.tuple_insert = appender_tuple_insert,
+	.tuple_insert_speculative = appender_tuple_insert_speculative,
+	.tuple_complete_speculative = appender_tuple_complete_speculative,
+	.multi_insert = appender_multi_insert,
+	.tuple_delete = appender_tuple_delete,
+	.tuple_update = appender_tuple_update,
+	.tuple_lock = appender_tuple_lock,
+	.finish_bulk_insert = appender_finish_bulk_insert,
+
+	.relation_set_new_filelocator = appender_relation_set_new_filelocator,
+	.relation_nontransactional_truncate = appender_relation_nontransactional_truncate,
+	.relation_copy_data = appender_relation_copy_data,
+	.relation_copy_for_cluster = appender_relation_copy_for_cluster,
+	.relation_vacuum = appender_vacuum_rel,
+	.scan_analyze_next_block = appender_scan_analyze_next_block,
+	.scan_analyze_next_tuple = appender_scan_analyze_next_tuple,
+	.index_build_range_scan = appender_index_build_range_scan,
+	.index_validate_scan = appender_index_validate_scan,
+
+	.relation_size = appender_relation_size,
+	.relation_needs_toast_table = appender_relation_needs_toast_table,
+	.relation_fetch_toast_slice = appender_fetch_toast_slice,
+	.relation_estimate_size = appender_relation_estimate_size,
+
+#if PG_VERSION_NUM < 180000
+	.scan_bitmap_next_block = appender_scan_bitmap_next_block,
+#endif
+	.scan_bitmap_next_tuple = appender_scan_bitmap_next_tuple,
+	.scan_sample_next_block = appender_scan_sample_next_block,
+	.scan_sample_next_tuple = appender_scan_sample_next_tuple,
+};
+
+/* ----------------------------------------------------------------------------
+ * Transaction and catalog hooks
+ * -------------------------------------------------------------------------
+ */
+
+static void
+appender_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_PRE_COMMIT:
+			appender_writer_pre_commit();
+			break;
+		case XACT_EVENT_PRE_PREPARE:
+			if (appender_writer_active() || appender_storage_pending())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot PREPARE a transaction that has modified appender tables")));
+			break;
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			appender_seg_cache_close();
+			appender_manifest_cache_reset();
+			appender_writer_end(true);
+			appender_storage_xact_end(true);
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			appender_seg_cache_close();
+			appender_manifest_cache_reset();
+			appender_writer_end(false);
+			appender_storage_xact_end(false);
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+appender_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						  SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_COMMIT_SUB || event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		bool		isCommit = (event == SUBXACT_EVENT_COMMIT_SUB);
+
+		appender_writer_subxact_end(isCommit);
+		appender_storage_subxact_end(isCommit);
+	}
+}
+
+/* Dropping an appender relation removes its segments at commit. */
+static void
+appender_object_access(ObjectAccessType access, Oid classId, Oid objectId,
+					   int subId, void *arg)
+{
+	HeapTuple	tup;
+	Form_pg_class form;
+
+	if (prev_object_access_hook)
+		prev_object_access_hook(access, classId, objectId, subId, arg);
+
+	/*
+	 * Partitioned appender tables carry no storage of their own and never
+	 * reach appender_relation_set_new_filelocator(), so they are checked
+	 * here.
+	 */
+	if (access == OAT_POST_CREATE && classId == RelationRelationId && subId == 0)
+		appender_check_created_relation(objectId);
+
+	if (access != OAT_DROP || classId != RelationRelationId || subId != 0)
+		return;
+
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(objectId));
+	if (!HeapTupleIsValid(tup))
+		return;
+
+	form = (Form_pg_class) GETSTRUCT(tup);
+	if ((form->relkind == RELKIND_RELATION || form->relkind == RELKIND_MATVIEW) &&
+		OidIsValid(form->relfilenode) &&
+		form->relam == get_table_am_oid("appender", true))
+	{
+		RelFileLocator rlocator;
+
+		rlocator.spcOid = OidIsValid(form->reltablespace) ?
+			form->reltablespace : MyDatabaseTableSpace;
+		rlocator.dbOid = MyDatabaseId;
+		rlocator.relNumber = form->relfilenode;
+
+		appender_storage_drop_at_commit(&rlocator);
+		appender_meta_delete(&rlocator);
+		appender_manifest_cache_forget(&rlocator);
+	}
+	ReleaseSysCache(tup);
+}
+
+/*
+ * Reject publications that would cover an appender table.  The table list is
+ * checked table by table, FOR ALL TABLES and TABLES IN SCHEMA by looking for
+ * an appender table in their scope.
+ */
+static void
+appender_check_publication_objects(List *pubobjects, bool for_all_tables)
+{
+	ListCell   *lc;
+	PublicationObjSpecType prevtype = PUBLICATIONOBJ_TABLE;
+	Oid			amoid = get_table_am_oid("appender", true);
+
+	if (for_all_tables)
+		appender_reject_publication(appender_find_table(InvalidOid));
+
+	foreach(lc, pubobjects)
+	{
+		PublicationObjSpec *pubobj = (PublicationObjSpec *) lfirst(lc);
+		PublicationObjSpecType type = pubobj->pubobjtype;
+
+		/*
+		 * A list such as "TABLE a, b" is parsed as one element per entry, all
+		 * but the first being continuations of the preceding type.
+		 */
+		if (type == PUBLICATIONOBJ_CONTINUATION)
+			type = prevtype;
+		prevtype = type;
+
+		if (type == PUBLICATIONOBJ_TABLE)
+		{
+			RangeVar   *rv = pubobj->pubtable != NULL ?
+				pubobj->pubtable->relation :
+				makeRangeVar(NULL, pubobj->name, pubobj->location);
+			Oid			relid;
+
+			relid = RangeVarGetRelid(rv, AccessShareLock, false);
+			if (OidIsValid(amoid) && get_rel_relam(relid) == amoid)
+				appender_reject_publication(rv->relname);
+		}
+		else
+		{
+			Oid			nspid = type == PUBLICATIONOBJ_TABLES_IN_CUR_SCHEMA ?
+				LookupCreationNamespace(pubobj->name) :
+				get_namespace_oid(pubobj->name, false);
+
+			appender_reject_publication(appender_find_table(nspid));
+		}
+	}
+}
+
+static void
+appender_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+						bool readOnlyTree, ProcessUtilityContext context,
+						ParamListInfo params, QueryEnvironment *queryEnv,
+						DestReceiver *dest, QueryCompletion *qc)
+{
+	if (IsA(pstmt->utilityStmt, CreatePublicationStmt))
+	{
+		CreatePublicationStmt *stmt = (CreatePublicationStmt *) pstmt->utilityStmt;
+
+		appender_check_publication_objects(stmt->pubobjects,
+										   stmt->for_all_tables);
+	}
+	else if (IsA(pstmt->utilityStmt, AlterPublicationStmt))
+	{
+		AlterPublicationStmt *stmt =
+			(AlterPublicationStmt *) pstmt->utilityStmt;
+
+		if (stmt->action == AP_AddObjects || stmt->action == AP_SetObjects)
+			appender_check_publication_objects(stmt->pubobjects,
+											   stmt->for_all_tables);
+	}
+
+	if (IsA(pstmt->utilityStmt, CreatedbStmt))
+		appender_check_createdb((CreatedbStmt *) pstmt->utilityStmt);
+
+	prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+						params, queryEnv, dest, qc);
+}
+
+static void
+appender_relcache_callback(Datum arg, Oid relid)
+{
+	appender_binding_forget(relid);
+	appender_meta_invalidate(relid);
+	appender_valdir_cache_reset();
+	appender_manifest_cache_reset();
+}
+
+void
+_PG_init(void)
+{
+	/* custom WAL resource managers can only be registered at startup */
+	if (!process_shared_preload_libraries_in_progress)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("immotus_appender must be loaded via shared_preload_libraries"),
+				 errhint("Add immotus_appender to shared_preload_libraries and restart the server.")));
+
+	DefineCustomIntVariable("immotus_appender.segment_size",
+							"Size at which an appender segment is sealed.",
+							NULL,
+							&appender_segment_size_mb,
+							1024, 1, 1024 * 1024,
+							PGC_SUSET, GUC_UNIT_MB,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("immotus_appender.prealloc_chunk",
+							"Chunk of a segment preallocated (zero-filled) at once.",
+							"Zero-filled ahead so commits inside the chunk only fdatasync; 0 disables.",
+							&appender_prealloc_chunk_kb,
+							1024, 0, 65536,
+							PGC_SIGHUP, GUC_UNIT_KB,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("immotus_appender.valdir_cache_size",
+							"Per-backend memory budget of cached value directories.",
+							"Least-recently-used segment directories are evicted when the cache grows past this size.",
+							&appender_valdir_cache_mb,
+							64, 1, 1024 * 1024,
+							PGC_USERSET, GUC_UNIT_MB,
+							NULL, NULL, NULL);
+	DefineCustomBoolVariable("immotus_appender.debug_log",
+							 "Emit a DEBUG1 line for every replayed or skipped segment record.",
+							 "For tests: proves which records crash recovery replays.",
+							 &appender_debug_log,
+							 false,
+							 PGC_SIGHUP,
+							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+	MarkGUCPrefixReserved("immotus_appender");
+
+	appender_slot_ops = TTSOpsVirtual;
+	appender_slot_ops.base_slot_size = sizeof(AppenderTupleTableSlot);
+	appender_slot_ops.clear = appender_slot_clear;
+	appender_slot_ops.getsomeattrs = appender_slot_getsomeattrs;
+	appender_slot_ops.materialize = appender_slot_materialize;
+	appender_slot_ops.copyslot = appender_slot_copyslot;
+	appender_slot_ops.copy_heap_tuple = appender_slot_copy_heap_tuple;
+	appender_slot_ops.copy_minimal_tuple = appender_slot_copy_minimal_tuple;
+
+	RegisterCustomRmgr(RM_APPENDER_ID, &appender_rmgr);
+	RegisterXactCallback(appender_xact_callback, NULL);
+	RegisterSubXactCallback(appender_subxact_callback, NULL);
+	CacheRegisterRelcacheCallback(appender_relcache_callback, (Datum) 0);
+
+	prev_object_access_hook = object_access_hook;
+	object_access_hook = appender_object_access;
+	prev_ProcessUtility = ProcessUtility_hook ? ProcessUtility_hook : standard_ProcessUtility;
+	ProcessUtility_hook = appender_ProcessUtility;
+}
+
+/* ----------------------------------------------------------------------------
+ * SQL-callable functions
+ * -------------------------------------------------------------------------
+ */
+
+PG_FUNCTION_INFO_V1(appender_tableam_handler);
+
+Datum
+appender_tableam_handler(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_POINTER(&appender_methods);
+}
+
+/* Trigger on appender_meta: the manifest is maintained by this module only. */
+PG_FUNCTION_INFO_V1(appender_meta_guard);
+
+Datum
+appender_meta_guard(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("appender_meta is managed by immotus_appender and must not be modified directly")));
+	pg_unreachable();
+}
+
+/* On-disk size of an appender relation's segment files. */
+PG_FUNCTION_INFO_V1(appender_relation_size_sql);
+
+Datum
+appender_relation_size_sql(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	int64		size;
+
+	if (rel->rd_tableam != &appender_methods)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not an appender table",
+						RelationGetRelationName(rel))));
+
+	size = appender_disk_size(rel);
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(size);
+}

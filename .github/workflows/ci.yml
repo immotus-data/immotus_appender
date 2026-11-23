@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  # The release pipeline runs the same suite against a tag, in a release
+  # build rather than the default assertion-enabled one.
+  workflow_call:
+    inputs:
+      build_type:
+        description: 'debug (assertions and debug symbols) or release'
+        type: string
+        required: false
+        default: debug
+
+jobs:
+  test:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18, 19]
+    env:
+      PG_BRANCH: REL_${{ matrix.pg }}_STABLE
+      PG_PREFIX: /home/runner/pgsql
+      PG_SRC: /tmp/postgres
+      BUILD_TYPE: ${{ inputs.build_type || 'debug' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex libipc-run-perl \
+            libreadline-dev perltidy zlib1g-dev
+
+      # The sources are needed both for the server and for the formatting
+      # tools of this branch, so they are always fetched.
+      - name: Fetch PostgreSQL sources
+        run: |
+          git clone --depth 1 --branch "$PG_BRANCH" \
+            https://github.com/postgres/postgres.git "$PG_SRC"
+
+      # The stable branches move with every minor release, so the cache is
+      # keyed by the branch head rather than by its name.
+      - name: Look up the branch head
+        id: branch
+        run: |
+          echo "sha=$(git -C "$PG_SRC" rev-parse --short=12 HEAD)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Cache PostgreSQL
+        id: cache-pg
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PG_PREFIX }}
+          key: pg-${{ env.PG_BRANCH }}-${{ steps.branch.outputs.sha }}-${{ env.BUILD_TYPE }}-v1
+
+      # Configuration runs even on a cache hit: the formatting tools below
+      # are built from the same tree.
+      - name: Configure PostgreSQL
+        working-directory: ${{ env.PG_SRC }}
+        run: |
+          flags=""
+          if [ "$BUILD_TYPE" = debug ]; then
+            flags="--enable-cassert --enable-debug"
+          fi
+          ./configure --prefix="$PG_PREFIX" --enable-tap-tests $flags
+
+      - name: Build PostgreSQL
+        if: steps.cache-pg.outputs.cache-hit != 'true'
+        working-directory: ${{ env.PG_SRC }}
+        run: |
+          make -j"$(nproc)" install
+          make -C src/test/isolation install
+          make -C contrib/amcheck install
+
+      - name: Build and install the extension
+        run: |
+          make PG_CONFIG="$PG_PREFIX/bin/pg_config"
+          make install PG_CONFIG="$PG_PREFIX/bin/pg_config"
+
+      - name: Start a test cluster
+        run: |
+          "$PG_PREFIX/bin/initdb" -D /tmp/data -E UTF8 --no-locale
+          echo "shared_preload_libraries = 'immotus_appender'" >> /tmp/data/postgresql.conf
+          "$PG_PREFIX/bin/pg_ctl" -D /tmp/data -l /tmp/data/log start
+
+      - name: Run tests
+        run: make installcheck PG_CONFIG="$PG_PREFIX/bin/pg_config"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          "$PG_PREFIX/bin/postgres" --version > pg-version.txt 2>&1 || true
+          "$PG_PREFIX/bin/pg_config" --configure > pg-configure.txt 2>&1 || true
+          cp /tmp/data/log ./server.log 2>/dev/null || true
+          echo '--- server.log ---'
+          cat server.log 2>/dev/null || true
+          echo '--- regression.diffs ---'
+          cat regression.diffs output_iso/regression.diffs 2>/dev/null || true
+          echo '--- TAP logs ---'
+          tail -n 200 tmp_check/log/* 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-pg${{ matrix.pg }}
+          path: |
+            server.log
+            pg-version.txt
+            pg-configure.txt
+            regression.diffs
+            results/
+            output_iso/
+            tmp_check/
+          if-no-files-found: ignore
+
+      # Style is checked last, once the code has proved it works.  Every
+      # major uses the tools of its own branch, which is what its own
+      # sources are laid out with; the formatters rewrite the tree in place,
+      # so a difference here means the commit needs another pass.
+      - name: Build pg_bsd_indent
+        working-directory: ${{ env.PG_SRC }}
+        run: make -C src/tools/pg_bsd_indent
+
+      # pgindent has to know every type name to lay out declarations, so the
+      # core list of this branch goes in together with the ones we add.
+      - name: Build the typedef list
+        run: |
+          cat "$PG_SRC/src/tools/pgindent/typedefs.list" typedefs.list |
+            sort -u > /tmp/typedefs.list
+
+      - name: pgindent
+        run: |
+          "$PG_SRC/src/tools/pgindent/pgindent" \
+            --indent="$PG_SRC/src/tools/pg_bsd_indent/pg_bsd_indent" \
+            --typedefs=/tmp/typedefs.list \
+            src/*.c src/*.h
+
+      - name: pgperltidy
+        working-directory: ${{ env.PG_SRC }}
+        run: ./src/tools/pgindent/pgperltidy "$GITHUB_WORKSPACE/t"
+
+      - name: Check for formatting changes
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::The sources are not formatted with the PostgreSQL ${{ matrix.pg }} tools; run pgindent and pgperltidy and commit the result."
+            exit 1
+          fi

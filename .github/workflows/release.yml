@@ -1,0 +1,146 @@
+name: Release
+
+# A tag push is the normal way to release; a manual run repeats the same work
+# for a tag that already exists, which is handy for a dry run or a re-upload.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release, for example v1.0.0'
+        type: string
+        required: true
+      draft:
+        description: 'Keep the GitHub release a draft'
+        type: boolean
+        default: true
+
+jobs:
+  preflight:
+    name: Pre-flight
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      # The tag has to be the version the extension reports, and the script
+      # it installs has to be there; a release that fails either check would
+      # install something other than its own name.
+      - name: Check the release sources
+        id: check
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::The tag $tag is not of the form v<major>.<minor>.<patch>."
+            exit 1
+          fi
+
+          control=$(sed -n "s/^default_version[[:space:]]*=[[:space:]]*'\(.*\)'/\1/p" \
+            immotus_appender.control)
+          if [ "$version" != "$control" ]; then
+            echo "::error::The tag says $version, immotus_appender.control says $control."
+            exit 1
+          fi
+
+          script="sql/immotus_appender--$control.sql"
+          if [ ! -f "$script" ]; then
+            echo "::error::$script does not exist."
+            exit 1
+          fi
+
+          if ! git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "::error::There is no tag $tag."
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "refs/tags/$tag^{commit}")" ]; then
+            echo "::error::HEAD is not at $tag."
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The release notes are the changelog entry for this version: a release
+      # nobody can read about is not a release.
+      - name: Check the changelog
+        run: |
+          awk -v want="## ${{ steps.check.outputs.version }}" '
+            /^## / {
+              if (found) exit
+              if ($0 == want || index($0, want " ") == 1) { found = 1; next }
+            }
+            found { print }
+          ' CHANGELOG.md > /tmp/notes.md
+
+          if ! grep -q '[^[:space:]]' /tmp/notes.md; then
+            echo "::error::CHANGELOG.md has no entry for ${{ steps.check.outputs.version }}."
+            exit 1
+          fi
+
+  test:
+    name: Test
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+    with:
+      build_type: release
+
+  publish:
+    name: Publish
+    runs-on: ubuntu-24.04
+    needs: [preflight, test]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Build the source archive
+        run: |
+          version="${{ needs.preflight.outputs.version }}"
+          git archive --format=tar.gz \
+            --prefix="immotus_appender-$version/" \
+            -o "immotus_appender-$version.tar.gz" HEAD
+          sha256sum "immotus_appender-$version.tar.gz" > sha256sums.txt
+          cat sha256sums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: immotus_appender-${{ needs.preflight.outputs.version }}
+          path: |
+            immotus_appender-*.tar.gz
+            sha256sums.txt
+
+      # The release notes are the changelog entry for this version.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ needs.preflight.outputs.version }}"
+          tag="${{ needs.preflight.outputs.tag }}"
+
+          awk -v want="## $version" '
+            /^## / {
+              if (found) exit
+              if ($0 == want || index($0, want " ") == 1) { found = 1; next }
+            }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+
+          args="--title immotus_appender-$version --notes-file release-notes.md"
+          if [ "${{ inputs.draft }}" != "false" ]; then
+            args="$args --draft"
+          fi
+
+          gh release create "$tag" \
+            "immotus_appender-$version.tar.gz" sha256sums.txt $args

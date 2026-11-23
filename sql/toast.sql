@@ -1,0 +1,91 @@
+-- Segment-local TOAST: large varlena values live in value blocks of the same
+-- segment, referenced by on-disk pointers through our relation_fetch_toast_slice.
+
+CREATE EXTENSION immotus_appender;
+
+-- 19 compresses with lz4 unless told otherwise; pin the method, the test is
+-- about where the value ends up, not about how it is packed.
+SET default_toast_compression = 'pglz';
+
+CREATE TABLE toast_t (id int, t text) USING appender;
+
+-- Small values stay inline.
+INSERT INTO toast_t VALUES (1, 'small');
+INSERT INTO toast_t VALUES (2, repeat('x', 100));
+
+-- Large values are stored out of line (EXTENDED storage compresses).
+INSERT INTO toast_t VALUES (3, repeat('a', 4000));
+INSERT INTO toast_t VALUES (4, repeat('b', 1000000));
+
+SELECT id, length(t), left(t, 3), right(t, 3) FROM toast_t ORDER BY id;
+
+-- Compressed on its way to disk.
+SELECT pg_column_compression(t) FROM toast_t WHERE id = 4;
+
+-- A slice of a compressed value detoasts through the AM callback.
+SELECT substr(t, 999991, 10) FROM toast_t WHERE id = 4;
+
+-- Storage modes.
+CREATE TABLE toast_s (id int, t text) USING appender;
+ALTER TABLE toast_s ALTER COLUMN t SET STORAGE EXTERNAL;
+INSERT INTO toast_s VALUES (1, repeat('c', 5000));
+-- EXTERNAL values are not compressed: a prefix slice is read as stored.
+SELECT length(t), pg_column_compression(t), left(t, 5) FROM toast_s;
+
+-- A varlena that must never be toasted (PLAIN) is always inline.
+CREATE TABLE toast_p (t text) USING appender;
+ALTER TABLE toast_p ALTER COLUMN t SET STORAGE PLAIN;
+INSERT INTO toast_p VALUES (repeat('d', 5000));
+SELECT length(t) FROM toast_p;
+
+-- Copying out of an appender table re-materializes external values, so the
+-- heap copy is self-contained after the source is dropped.
+CREATE TABLE toast_h (t text) USING heap;
+INSERT INTO toast_h SELECT t FROM toast_t WHERE id = 4;
+SELECT length(t) FROM toast_h;
+DROP TABLE toast_t;
+SELECT length(t) FROM toast_h;
+
+-- The reverse: external values from a heap table are re-stored on insert.
+CREATE TABLE toast_h2 (t text) USING heap;
+ALTER TABLE toast_h2 ALTER COLUMN t SET STORAGE EXTERNAL;
+INSERT INTO toast_h2 VALUES (repeat('e', 100000));
+CREATE TABLE toast_t2 (t text) USING appender;
+INSERT INTO toast_t2 SELECT t FROM toast_h2;
+SELECT length(t), left(t, 3) FROM toast_t2;
+
+-- STORAGE MAIN values are compressed inline and never toasted.
+CREATE TABLE toast_m (t text) USING appender;
+ALTER TABLE toast_m ALTER COLUMN t SET STORAGE MAIN;
+INSERT INTO toast_m VALUES (repeat('f', 5000));
+SELECT length(t), pg_column_compression(t), left(t, 3) FROM toast_m;
+
+-- TRUNCATE swaps the storage; values written after it are still correct.
+CREATE TABLE toast_tr (id int, t text) USING appender;
+INSERT INTO toast_tr VALUES (1, repeat('g', 5000));
+TRUNCATE toast_tr;
+INSERT INTO toast_tr VALUES (2, repeat('h', 5000));
+SELECT id, length(t), left(t, 3) FROM toast_tr;
+
+DROP TABLE toast_s, toast_p, toast_h, toast_h2, toast_t2, toast_m, toast_tr;
+
+-- A value is readable by the command that wrote it and by its own transaction.
+CREATE TABLE toast_own (id int, t text) USING appender;
+INSERT INTO toast_own VALUES (1, repeat('i', 100000)) RETURNING id, length(t);
+BEGIN;
+INSERT INTO toast_own VALUES (2, repeat('j', 100000));
+SELECT id, length(t), left(t, 2) FROM toast_own WHERE id = 2;
+ROLLBACK;
+
+-- Values spread over several small segments are all found.
+SET immotus_appender.segment_size = 1;
+CREATE TABLE toast_seg (id int, t text) USING appender;
+ALTER TABLE toast_seg ALTER COLUMN t SET STORAGE EXTERNAL;
+INSERT INTO toast_seg SELECT g, repeat(md5(g::text), 2000) FROM generate_series(1, 300) g;
+RESET immotus_appender.segment_size;
+SELECT count(*) > 1 AS several_segments FROM appender_meta
+ WHERE relfilenode = (SELECT relfilenode FROM pg_class WHERE oid = 'toast_seg'::regclass);
+SELECT count(*), count(*) FILTER (WHERE left(t, 32) = md5(id::text)) AS ok FROM toast_seg;
+
+DROP TABLE toast_own, toast_seg;
+DROP EXTENSION immotus_appender;
