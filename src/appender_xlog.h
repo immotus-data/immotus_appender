@@ -19,8 +19,11 @@
 
 #include "appender_datafile.h"
 
-/* Reserve a unique id before a public release; experimental until then. */
-#define RM_APPENDER_ID				RM_EXPERIMENTAL_ID
+/*
+ * Reserved for immotus_appender on the PostgreSQL wiki:
+ * https://wiki.postgresql.org/wiki/CustomWALResourceManagers
+ */
+#define RM_APPENDER_ID				152
 
 #define XLOG_APPENDER_CREATE		0x00
 #define XLOG_APPENDER_BLOCK			0x10
